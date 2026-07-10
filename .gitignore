@@ -1,0 +1,9 @@
+dist/
+*.so
+*.h
+*.test
+coverage.out
+.coverage/
+.DS_Store
+tmp/
+*.log

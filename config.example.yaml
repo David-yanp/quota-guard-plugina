@@ -1,0 +1,43 @@
+plugins:
+  enabled: true
+  dir: "plugins"
+  configs:
+    quota-guard:
+      enabled: true
+      priority: 100
+      state_file: "plugins/quota-guard-state.json"
+      min_remaining_percent: 10
+      sticky_current_auth_seconds: 120
+      fail_when_all_low: true
+      delegate_when_unconfigured: "fill-first"
+      default_5h_limit_score: 1000000
+      default_7d_limit_score: 10000000
+      default_monthly_limit_score: 40000000
+      pro_limit_multiplier: 20
+      inflight_reserve_score: 30000
+      max_inflight_age_seconds: 1800
+      count_failed_requests: false
+      input_weight: 1
+      output_weight: 1
+      reasoning_weight: 1
+      cached_weight: 0.1
+      request_score: 1
+      quota_refresh_enabled: true
+      quota_refresh_trigger_endpoint: "http://cpa-usage-keeper:8080/cpa/api/v1/quota/refresh"
+      quota_refresh_trigger_wait_seconds: 2
+      quota_refresh_endpoint: "http://cpa-usage-keeper:8080/cpa/api/v1/quota/refresh/{auth_index}"
+      quota_refresh_interval_seconds: 60
+      quota_refresh_min_interval_per_auth_seconds: 30
+      quota_refresh_timeout_seconds: 10
+      quota_refresh_on_startup: true
+      quota_snapshot_max_age_seconds: 900
+      resource_actions_require_management_key: false
+      request_error_status_override_enabled: true
+      client_affinity_enabled: false
+      client_affinity_header: "X-CPA-Client-ID"
+      client_affinity_group_min_size: 2
+      client_affinity_assignment_mode: "auto-with-overrides"
+      client_affinity_store_plain_id: true
+      client_affinity_auto_weight_by_quota: true
+      client_affinity_repeatable_auths: []
+      client_affinity_groups: {}
