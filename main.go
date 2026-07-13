@@ -2122,6 +2122,9 @@ func (g *quotaGuard) releaseInflightLocked(account *accountState) inflightReserv
 }
 
 func (g *quotaGuard) recordClientActivityLocked(event clientActivityEvent) {
+	if !g.cfg.ClientAffinityRebalanceEnabled {
+		return
+	}
 	if strings.TrimSpace(event.ClientID) == "" || strings.TrimSpace(event.GroupID) == "" {
 		return
 	}

@@ -1913,6 +1913,18 @@ func TestRebalanceStatePersistsActivityAndHistory(t *testing.T) {
 	}
 }
 
+func TestClientActivityIsNotRecordedWhenRebalanceDisabled(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.ClientAffinityEnabled = true
+	g.cfg.ClientAffinityRebalanceEnabled = false
+	if _, err := g.pick(affinityPickRequest("client-a", "a", "b")); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.state.ClientActivity) != 0 {
+		t.Fatalf("activity = %d, want none", len(g.state.ClientActivity))
+	}
+}
+
 func TestMain(m *testing.M) {
 	guard = newQuotaGuard(time.Now)
 	os.Exit(m.Run())
