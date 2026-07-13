@@ -1714,6 +1714,205 @@ func TestDeleteLocalAccountStateOnlyRemovesStaleState(t *testing.T) {
 	}
 }
 
+func TestFetchKeeperUsageSnapshotParsesAuthFiles(t *testing.T) {
+	g := testGuard(t)
+	previous := callHostFunc
+	t.Cleanup(func() { callHostFunc = previous })
+	callHostFunc = func(method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			t.Fatalf("method = %q", method)
+		}
+		resp, _ := json.Marshal(pluginapi.HTTPResponse{StatusCode: 200, Body: mustJSON(t, map[string]any{
+			"window":        "60m",
+			"window_start":  g.now().Add(-time.Hour),
+			"window_end":    g.now(),
+			"current_usage": map[string]any{"auth_files": []map[string]any{{"key": "idx-a", "tokens": 1234, "requests": 7, "share": 80}}},
+		})})
+		return resp, nil
+	}
+	snapshot, err := fetchKeeperUsageSnapshot("http://keeper/usage", g.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snapshot.AuthFiles["idx-a"]; got.Tokens != 1234 || got.Requests != 7 {
+		t.Fatalf("usage = %#v", got)
+	}
+}
+
+func TestFetchKeeperUsageSnapshotFailsClosed(t *testing.T) {
+	g := testGuard(t)
+	previous := callHostFunc
+	t.Cleanup(func() { callHostFunc = previous })
+	tests := []struct {
+		name string
+		resp pluginapi.HTTPResponse
+	}{
+		{name: "forbidden", resp: pluginapi.HTTPResponse{StatusCode: 403, Body: []byte(`{"error":"forbidden"}`)}},
+		{name: "empty", resp: pluginapi.HTTPResponse{StatusCode: 200, Body: mustJSON(t, map[string]any{"window_end": g.now(), "current_usage": map[string]any{"auth_files": []any{}}})}},
+		{name: "stale", resp: pluginapi.HTTPResponse{StatusCode: 200, Body: mustJSON(t, map[string]any{"window_end": g.now().Add(-10 * time.Minute), "current_usage": map[string]any{"auth_files": []map[string]any{{"key": "idx-a", "tokens": 1}}}})}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			callHostFunc = func(string, any) (json.RawMessage, error) {
+				return mustJSON(t, tt.resp), nil
+			}
+			if _, err := fetchKeeperUsageSnapshot("http://keeper/usage", g.now()); err == nil {
+				t.Fatal("fetch succeeded, want fail closed")
+			}
+		})
+	}
+}
+
+func setupRebalanceGuard(t *testing.T) *quotaGuard {
+	t.Helper()
+	g := testGuard(t)
+	g.cfg.ClientAffinityEnabled = true
+	g.cfg.ClientAffinityRebalanceEnabled = true
+	g.cfg.ClientAffinityRebalanceMode = "auto"
+	g.cfg.ClientAffinityRebalanceWarmupSecs = 0
+	g.cfg.ClientAffinityRebalanceIdleSecs = 600
+	g.cfg.ClientAffinityRebalanceCooldownSecs = 3600
+	g.cfg.ClientAffinityManualCooldownSecs = 86400
+	g.state.Rebalance.StartedAt = g.now().Add(-2 * time.Hour)
+	g.state.ManualGroups["group-a"] = []string{"a", "backup-a"}
+	g.state.ManualGroups["group-b"] = []string{"b", "backup-b"}
+	for id, index := range map[string]string{"a": "idx-a", "backup-a": "idx-backup-a", "b": "idx-b", "backup-b": "idx-backup-b"} {
+		account := g.ensureAccountByKeyLocked(id)
+		account.AuthIndex = index
+		account.Status = "active"
+		account.ActiveWindows = map[string]bool{window7d: true}
+		account.Limits[window7d] = 100
+	}
+	return g
+}
+
+func rebalanceSnapshot(g *quotaGuard, sourceTokens, targetTokens float64) keeperUsageSnapshot {
+	return keeperUsageSnapshot{
+		WindowStart: g.now().Add(-time.Hour),
+		WindowEnd:   g.now(),
+		FetchedAt:   g.now(),
+		AuthFiles: map[string]keeperUsageItem{
+			"idx-a": {AuthIndex: "idx-a", Tokens: sourceTokens, Requests: 90},
+			"idx-b": {AuthIndex: "idx-b", Tokens: targetTokens, Requests: 10},
+		},
+	}
+}
+
+func addRebalanceClient(g *quotaGuard, clientID, groupID string, lastSeen time.Time, score float64) {
+	g.state.ClientBindings[clientID] = &clientBindingState{ClientID: clientID, GroupID: groupID, LastSeenAt: lastSeen}
+	g.state.ClientActivity = append(g.state.ClientActivity,
+		clientActivityEvent{At: g.now().Add(-30 * time.Minute), ClientID: clientID, GroupID: groupID, AuthID: "a", Kind: "pick"},
+		clientActivityEvent{At: g.now().Add(-29 * time.Minute), ClientID: clientID, GroupID: groupID, AuthID: "a", Kind: "usage", Score: score},
+	)
+}
+
+func TestRebalanceMovesOneIdleRecentlyUsedBinding(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	addRebalanceClient(g, "client-idle", "group-a", g.now().Add(-15*time.Minute), 30)
+	addRebalanceClient(g, "client-active", "group-a", g.now().Add(-time.Minute), 60)
+	entry := g.analyzeRebalanceLocked(rebalanceSnapshot(g, 90, 10), false)
+	if entry.Result != "moved" || entry.ClientID != "client-idle" {
+		t.Fatalf("entry = %#v", entry)
+	}
+	if got := g.state.ClientBindings["client-idle"].GroupID; got != "group-b" {
+		t.Fatalf("group = %q", got)
+	}
+	if got := g.state.ClientBindings["client-active"].GroupID; got != "group-a" {
+		t.Fatalf("active client moved to %q", got)
+	}
+}
+
+func TestRebalanceLeavesUnusedAndCoolingBindingsUnchanged(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*clientBindingState, *quotaGuard)
+	}{
+		{name: "unused", mutate: func(binding *clientBindingState, g *quotaGuard) { binding.LastSeenAt = g.now().Add(-2 * time.Hour) }},
+		{name: "manual cooldown", mutate: func(binding *clientBindingState, g *quotaGuard) { binding.LastManualMoveAt = g.now().Add(-time.Hour) }},
+		{name: "auto cooldown", mutate: func(binding *clientBindingState, g *quotaGuard) {
+			binding.LastAutoMoveAt = g.now().Add(-10 * time.Minute)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := setupRebalanceGuard(t)
+			addRebalanceClient(g, "client-idle", "group-a", g.now().Add(-15*time.Minute), 30)
+			addRebalanceClient(g, "client-active", "group-a", g.now().Add(-time.Minute), 60)
+			tt.mutate(g.state.ClientBindings["client-idle"], g)
+			entry := g.analyzeRebalanceLocked(rebalanceSnapshot(g, 90, 10), false)
+			if entry.Result == "moved" {
+				t.Fatalf("entry = %#v", entry)
+			}
+			if got := g.state.ClientBindings["client-idle"].GroupID; got != "group-a" {
+				t.Fatalf("group = %q", got)
+			}
+		})
+	}
+}
+
+func TestRebalanceObserveModeRecordsRecommendationWithoutMoving(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	g.cfg.ClientAffinityRebalanceMode = "observe"
+	addRebalanceClient(g, "client-idle", "group-a", g.now().Add(-15*time.Minute), 30)
+	addRebalanceClient(g, "client-active", "group-a", g.now().Add(-time.Minute), 60)
+	entry := g.analyzeRebalanceLocked(rebalanceSnapshot(g, 90, 10), false)
+	if entry.Result != "recommended" {
+		t.Fatalf("entry = %#v", entry)
+	}
+	if got := g.state.ClientBindings["client-idle"].GroupID; got != "group-a" {
+		t.Fatalf("group = %q", got)
+	}
+}
+
+func TestRebalanceOnceDoesNotBypassWarmup(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	g.cfg.ClientAffinityRebalanceWarmupSecs = 3600
+	g.state.Rebalance.StartedAt = g.now().Add(-10 * time.Minute)
+	addRebalanceClient(g, "client-idle", "group-a", g.now().Add(-15*time.Minute), 30)
+	addRebalanceClient(g, "client-active", "group-a", g.now().Add(-time.Minute), 60)
+	entry := g.analyzeRebalanceLocked(rebalanceSnapshot(g, 90, 10), true)
+	if entry.Result != "observed" || !strings.Contains(entry.Reason, "warmup") {
+		t.Fatalf("entry = %#v", entry)
+	}
+	if got := g.state.ClientBindings["client-idle"].GroupID; got != "group-a" {
+		t.Fatalf("group = %q", got)
+	}
+}
+
+func TestRebalanceFailsClosedForUnattributedSharedBackup(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	g.state.ManualGroups["group-a"] = []string{"a", "shared"}
+	g.state.ManualGroups["group-b"] = []string{"b", "shared"}
+	shared := g.ensureAccountByKeyLocked("shared")
+	shared.AuthIndex = "idx-shared"
+	shared.Status = "active"
+	shared.ActiveWindows = map[string]bool{window7d: true}
+	shared.Limits[window7d] = 100
+	snapshot := rebalanceSnapshot(g, 90, 10)
+	snapshot.AuthFiles["idx-shared"] = keeperUsageItem{AuthIndex: "idx-shared", Tokens: 50, Requests: 5}
+	entry := g.analyzeRebalanceLocked(snapshot, false)
+	if entry.Result != "error" || !strings.Contains(entry.Reason, "cannot be attributed") {
+		t.Fatalf("entry = %#v", entry)
+	}
+}
+
+func TestRebalanceStatePersistsActivityAndHistory(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	g.state.ClientActivity = append(g.state.ClientActivity, clientActivityEvent{At: g.now(), ClientID: "client-a", GroupID: "group-a", AuthID: "a", Kind: "pick"})
+	g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: g.now(), Action: "analyze", Result: "observed", Reason: "test"})
+	if err := g.saveStateLocked(); err != nil {
+		t.Fatal(err)
+	}
+	loaded := newQuotaGuard(g.now)
+	loaded.cfg = g.cfg
+	if err := loaded.loadStateLocked(); err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.state.ClientActivity) != 1 || len(loaded.state.Rebalance.History) != 1 {
+		t.Fatalf("activity=%d history=%d", len(loaded.state.ClientActivity), len(loaded.state.Rebalance.History))
+	}
+}
+
 func TestMain(m *testing.M) {
 	guard = newQuotaGuard(time.Now)
 	os.Exit(m.Run())

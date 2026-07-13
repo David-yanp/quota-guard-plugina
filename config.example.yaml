@@ -41,3 +41,16 @@ plugins:
       client_affinity_auto_weight_by_quota: true
       client_affinity_repeatable_auths: []
       client_affinity_groups: {}
+      client_affinity_rebalance_enabled: true
+      client_affinity_rebalance_mode: "observe"
+      client_affinity_rebalance_usage_endpoint: "http://cpa-usage-keeper:8080/cpa/api/v1/usage/overview/realtime?window=60m"
+      client_affinity_rebalance_interval_seconds: 600
+      client_affinity_rebalance_window_minutes: 60
+      client_affinity_rebalance_idle_seconds: 600
+      client_affinity_rebalance_cooldown_seconds: 3600
+      client_affinity_manual_move_cooldown_seconds: 86400
+      client_affinity_rebalance_warmup_seconds: 3600
+      client_affinity_rebalance_max_moves_per_cycle: 1
+      client_affinity_rebalance_min_load_ratio: 1.5
+      client_affinity_rebalance_min_improvement_percent: 10
+      client_affinity_rebalance_history_limit: 200

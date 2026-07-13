@@ -76,6 +76,13 @@ Quota Guard is a CLIProxyAPI plugin that adds quota-aware fill-first scheduling 
 - Automatic affinity groups should use Plus/Team style accounts as the main member and Pro / explicitly repeatable accounts only as backup members. A Pro backup must not take primary group traffic while the main account remains eligible above reserve.
 - Automatic group IDs should be stable for the main account so existing client bindings do not drift when candidate order changes.
 - Stable group IDs are not client hash assignment. Current new-client assignment is `binding_count / group_weight` among eligible groups; existing bindings stay sticky unless the bound group is unavailable or an operator deletes/moves them.
+- Optional load rebalancing must use Keeper realtime auth-file usage as the group-level source of truth and plugin-side scheduler/usage activity only to estimate each client's share.
+- Normalize group load by the main account capacity. Do not count a shared Pro/repeatable backup as capacity in every group.
+- Automatic rebalance candidates must have activity inside the configured 60-minute window, be idle for at least 10 minutes, and be outside automatic/manual move cooldowns. Bindings with no activity in the window stay unchanged.
+- Rebalance at most one binding per default 10-minute cycle. Automatic moves cool down for 60 minutes; manual moves cool down for 24 hours.
+- Shared backup usage must be allocated by recorded group picks. If attribution is unavailable, fail closed and record the reason instead of moving a binding.
+- `observe` mode is required for grey rollout. It may analyze and record recommendations but must not mutate bindings.
+- Persist rebalance history with the source/target groups, client, load metrics, idle duration, predicted improvement, result, and reason.
 - If current primary becomes skipped after refresh or status changes, show stale/last-selected state only. Do not mutate scheduler state from UI refresh; actual switching belongs to the next `scheduler.pick`.
 - Match the visual theme of official `management.html`. Use the same browser theme key (`cli-proxy-theme`) and compatible CSS variables such as `--bg-primary`, `--bg-secondary`, `--text-primary`, `--border-color`, and `--primary-color`.
 - Support `white`, `dark`, and `auto` theme behavior. Avoid hard-coded slate/teal color palettes that diverge from the management panel.

@@ -29,6 +29,18 @@ When `client_affinity_enabled` is true, requests with `X-CPA-Client-ID` are boun
 - The current assignment algorithm is not a hash-to-group algorithm. New clients are assigned to the eligible group with the lowest `binding_count / group_weight` score. Existing bindings stay where they are unless the group becomes unavailable or an operator moves/deletes them.
 - Pro/repeatable backup accounts may appear in multiple groups, but should not receive group primary traffic while the main member is eligible above reserve.
 
+### Smooth Load Rebalancing
+
+Quota Guard can combine Keeper's rolling auth-file usage with plugin-side client activity to rebalance persistent bindings without disrupting active sessions.
+
+- Keeper `current_usage.auth_files` is authoritative for group-level tokens and requests.
+- Client pick and usage activity is retained only for the configured rolling window and cooldown periods.
+- Loads are normalized by the main account capacity; shared Pro backups are not counted as group capacity multiple times.
+- Only clients used during the last hour and idle for at least 10 minutes are eligible to move. Completely unused bindings stay unchanged.
+- Automatic moves are limited to one per cycle, followed by a 60-minute cooldown. Manual moves receive a 24-hour cooldown.
+- `observe` mode records recommendations without changing bindings. `auto` mode applies moves that satisfy the load-ratio and predicted-improvement guards.
+- Keeper errors, stale responses, missing auth usage, or unattributable shared-backup usage fail closed and never interrupt normal scheduling.
+
 ## Resource UI
 
 The resource UI is available at:
@@ -43,6 +55,8 @@ Operational details:
 - `Client Bindings` is collapsed by default and sorted by `Last Seen` descending.
 - `Delete Selected` removes mistaken or obsolete client bindings.
 - `Move Selected` moves selected client bindings to an eligible target group. This is the supported manual rebalance path when persistent affinity leaves a group too full or too empty.
+- `Analyze Now` refreshes Keeper load data and records a recommendation. `Rebalance Once` applies at most one guarded move.
+- Group rows show rolling tokens, actual and capacity target shares, and normalized load factors. Rebalance history remains collapsed by default.
 - Resource UI actions do not require a management key by default; protect the route with network or reverse-proxy rules if it is exposed outside a trusted network.
 - The page uses the same theme tokens as `management.html`, including `white`, `dark`, and `auto` theme support through the `cli-proxy-theme` browser setting.
 
@@ -110,6 +124,9 @@ Start from `config.example.yaml` and merge the `plugins.configs.quota-guard` blo
 - `quota_refresh_endpoint`: per-auth refresh endpoint template. Supports `{auth_index}`, `{auth_id}`, and `{provider}`.
 - `request_error_status_override_enabled`: keeps request-scoped client errors from unnecessarily moving traffic away from an otherwise healthy account.
 - `client_affinity_enabled`: enables persistent `X-CPA-Client-ID` group affinity.
+- `client_affinity_rebalance_enabled`: enables Keeper-backed load analysis.
+- `client_affinity_rebalance_mode`: `observe` records recommendations; `auto` applies eligible moves.
+- `client_affinity_rebalance_usage_endpoint`: Keeper realtime usage endpoint, normally using `window=60m`.
 - `resource_actions_require_management_key`: controls whether resource-page actions require the management key.
 
 ## Management Routes

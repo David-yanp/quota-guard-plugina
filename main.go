@@ -80,7 +80,7 @@ import (
 
 const (
 	pluginName          = "quota-guard"
-	pluginVersion       = "0.1.0"
+	pluginVersion       = "0.2.0"
 	resourceStatusPath  = "/status"
 	contentTypeJSON     = "application/json; charset=utf-8"
 	contentTypeHTML     = "text/html; charset=utf-8"
@@ -150,6 +150,19 @@ type pluginConfig struct {
 	ClientAffinityAutoWeightByQuota     bool                `yaml:"client_affinity_auto_weight_by_quota" json:"client_affinity_auto_weight_by_quota"`
 	ClientAffinityGroups                map[string][]string `yaml:"client_affinity_groups,omitempty" json:"client_affinity_groups,omitempty"`
 	ClientAffinityRepeatableAuths       []string            `yaml:"client_affinity_repeatable_auths,omitempty" json:"client_affinity_repeatable_auths,omitempty"`
+	ClientAffinityRebalanceEnabled      bool                `yaml:"client_affinity_rebalance_enabled" json:"client_affinity_rebalance_enabled"`
+	ClientAffinityRebalanceMode         string              `yaml:"client_affinity_rebalance_mode" json:"client_affinity_rebalance_mode"`
+	ClientAffinityRebalanceUsageURL     string              `yaml:"client_affinity_rebalance_usage_endpoint" json:"client_affinity_rebalance_usage_endpoint,omitempty"`
+	ClientAffinityRebalanceIntervalSecs int64               `yaml:"client_affinity_rebalance_interval_seconds" json:"client_affinity_rebalance_interval_seconds"`
+	ClientAffinityRebalanceWindowMins   int64               `yaml:"client_affinity_rebalance_window_minutes" json:"client_affinity_rebalance_window_minutes"`
+	ClientAffinityRebalanceIdleSecs     int64               `yaml:"client_affinity_rebalance_idle_seconds" json:"client_affinity_rebalance_idle_seconds"`
+	ClientAffinityRebalanceCooldownSecs int64               `yaml:"client_affinity_rebalance_cooldown_seconds" json:"client_affinity_rebalance_cooldown_seconds"`
+	ClientAffinityManualCooldownSecs    int64               `yaml:"client_affinity_manual_move_cooldown_seconds" json:"client_affinity_manual_move_cooldown_seconds"`
+	ClientAffinityRebalanceWarmupSecs   int64               `yaml:"client_affinity_rebalance_warmup_seconds" json:"client_affinity_rebalance_warmup_seconds"`
+	ClientAffinityRebalanceMaxMoves     int                 `yaml:"client_affinity_rebalance_max_moves_per_cycle" json:"client_affinity_rebalance_max_moves_per_cycle"`
+	ClientAffinityRebalanceMinLoadRatio float64             `yaml:"client_affinity_rebalance_min_load_ratio" json:"client_affinity_rebalance_min_load_ratio"`
+	ClientAffinityRebalanceMinImprove   float64             `yaml:"client_affinity_rebalance_min_improvement_percent" json:"client_affinity_rebalance_min_improvement_percent"`
+	ClientAffinityRebalanceHistoryLimit int                 `yaml:"client_affinity_rebalance_history_limit" json:"client_affinity_rebalance_history_limit"`
 }
 
 func defaultConfig() pluginConfig {
@@ -192,6 +205,19 @@ func defaultConfig() pluginConfig {
 		ClientAffinityStorePlainID:          true,
 		ClientAffinityAutoWeightByQuota:     true,
 		ClientAffinityRepeatableAuths:       nil,
+		ClientAffinityRebalanceEnabled:      false,
+		ClientAffinityRebalanceMode:         "observe",
+		ClientAffinityRebalanceUsageURL:     "http://cpa-usage-keeper:8080/cpa/api/v1/usage/overview/realtime?window=60m",
+		ClientAffinityRebalanceIntervalSecs: 600,
+		ClientAffinityRebalanceWindowMins:   60,
+		ClientAffinityRebalanceIdleSecs:     600,
+		ClientAffinityRebalanceCooldownSecs: 3600,
+		ClientAffinityManualCooldownSecs:    86400,
+		ClientAffinityRebalanceWarmupSecs:   3600,
+		ClientAffinityRebalanceMaxMoves:     1,
+		ClientAffinityRebalanceMinLoadRatio: 1.5,
+		ClientAffinityRebalanceMinImprove:   10,
+		ClientAffinityRebalanceHistoryLimit: 200,
 	}
 }
 
@@ -251,6 +277,8 @@ type stateFile struct {
 	ManualGroups     map[string][]string            `json:"manual_groups,omitempty"`
 	Groups           map[string]*affinityGroupState `json:"groups,omitempty"`
 	GroupCurrent     map[string]*groupCurrentState  `json:"group_current,omitempty"`
+	ClientActivity   []clientActivityEvent          `json:"client_activity,omitempty"`
+	Rebalance        rebalanceState                 `json:"rebalance,omitempty"`
 }
 
 type accountState struct {
@@ -303,7 +331,10 @@ type usageEvent struct {
 }
 
 type inflightReserve struct {
-	At time.Time `json:"at"`
+	At       time.Time `json:"at"`
+	ClientID string    `json:"client_id,omitempty"`
+	GroupID  string    `json:"group_id,omitempty"`
+	AuthID   string    `json:"auth_id,omitempty"`
 }
 
 type calib struct {
@@ -314,12 +345,77 @@ type calib struct {
 }
 
 type clientBindingState struct {
-	ClientID   string    `json:"client_id"`
-	GroupID    string    `json:"group_id"`
-	Source     string    `json:"source,omitempty"`
-	CreatedAt  time.Time `json:"created_at,omitempty"`
-	UpdatedAt  time.Time `json:"updated_at,omitempty"`
-	LastSeenAt time.Time `json:"last_seen_at,omitempty"`
+	ClientID         string    `json:"client_id"`
+	GroupID          string    `json:"group_id"`
+	Source           string    `json:"source,omitempty"`
+	CreatedAt        time.Time `json:"created_at,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at,omitempty"`
+	LastSeenAt       time.Time `json:"last_seen_at,omitempty"`
+	LastAutoMoveAt   time.Time `json:"last_auto_move_at,omitempty"`
+	LastManualMoveAt time.Time `json:"last_manual_move_at,omitempty"`
+	LastMoveReason   string    `json:"last_move_reason,omitempty"`
+}
+
+type clientActivityEvent struct {
+	At       time.Time `json:"at"`
+	ClientID string    `json:"client_id"`
+	GroupID  string    `json:"group_id"`
+	AuthID   string    `json:"auth_id"`
+	Kind     string    `json:"kind"`
+	Score    float64   `json:"score,omitempty"`
+}
+
+type keeperUsageSnapshot struct {
+	WindowStart time.Time                  `json:"window_start,omitempty"`
+	WindowEnd   time.Time                  `json:"window_end,omitempty"`
+	FetchedAt   time.Time                  `json:"fetched_at,omitempty"`
+	AuthFiles   map[string]keeperUsageItem `json:"auth_files,omitempty"`
+}
+
+type keeperUsageItem struct {
+	AuthIndex string  `json:"auth_index"`
+	Label     string  `json:"label,omitempty"`
+	Tokens    float64 `json:"tokens"`
+	Requests  int64   `json:"requests"`
+	Share     float64 `json:"share,omitempty"`
+}
+
+type rebalanceState struct {
+	StartedAt      time.Time                 `json:"started_at,omitempty"`
+	LastAnalysisAt time.Time                 `json:"last_analysis_at,omitempty"`
+	LastError      string                    `json:"last_error,omitempty"`
+	KeeperUsage    keeperUsageSnapshot       `json:"keeper_usage,omitempty"`
+	Groups         map[string]groupLoadState `json:"groups,omitempty"`
+	History        []rebalanceHistoryEntry   `json:"history,omitempty"`
+}
+
+type groupLoadState struct {
+	GroupID     string  `json:"group_id"`
+	Tokens      float64 `json:"tokens"`
+	Requests    float64 `json:"requests"`
+	Capacity    float64 `json:"capacity"`
+	ActualShare float64 `json:"actual_share"`
+	TargetShare float64 `json:"target_share"`
+	LoadFactor  float64 `json:"load_factor"`
+	Eligible    bool    `json:"eligible"`
+	Reason      string  `json:"reason,omitempty"`
+}
+
+type rebalanceHistoryEntry struct {
+	At                 time.Time `json:"at"`
+	Action             string    `json:"action"`
+	Result             string    `json:"result"`
+	ClientID           string    `json:"client_id,omitempty"`
+	FromGroup          string    `json:"from_group,omitempty"`
+	ToGroup            string    `json:"to_group,omitempty"`
+	Reason             string    `json:"reason"`
+	SourceTokens       float64   `json:"source_tokens,omitempty"`
+	TargetTokens       float64   `json:"target_tokens,omitempty"`
+	SourceLoadFactor   float64   `json:"source_load_factor,omitempty"`
+	TargetLoadFactor   float64   `json:"target_load_factor,omitempty"`
+	IdleSeconds        int64     `json:"idle_seconds,omitempty"`
+	EstimatedTokens    float64   `json:"estimated_tokens,omitempty"`
+	ImprovementPercent float64   `json:"improvement_percent,omitempty"`
 }
 
 type affinityGroupState struct {
@@ -409,6 +505,7 @@ type affinitySnapshot struct {
 	GroupMinSize      int                     `json:"group_min_size,omitempty"`
 	Groups            []affinityGroupSnapshot `json:"groups,omitempty"`
 	Bindings          []clientBindingSnapshot `json:"bindings,omitempty"`
+	Rebalance         rebalanceState          `json:"rebalance,omitempty"`
 }
 
 type affinityGroupSnapshot struct {
@@ -424,15 +521,26 @@ type affinityGroupSnapshot struct {
 	Eligible         bool      `json:"eligible"`
 	Reason           string    `json:"reason,omitempty"`
 	BindingCount     int       `json:"binding_count,omitempty"`
+	Tokens60m        float64   `json:"tokens_60m,omitempty"`
+	ActualShare      float64   `json:"actual_share,omitempty"`
+	TargetShare      float64   `json:"target_share,omitempty"`
+	LoadFactor       float64   `json:"load_factor,omitempty"`
+	MainCapacity     float64   `json:"main_capacity,omitempty"`
 }
 
 type clientBindingSnapshot struct {
-	ClientID   string    `json:"client_id"`
-	GroupID    string    `json:"group_id"`
-	Source     string    `json:"source,omitempty"`
-	CreatedAt  time.Time `json:"created_at,omitempty"`
-	UpdatedAt  time.Time `json:"updated_at,omitempty"`
-	LastSeenAt time.Time `json:"last_seen_at,omitempty"`
+	ClientID         string    `json:"client_id"`
+	GroupID          string    `json:"group_id"`
+	Source           string    `json:"source,omitempty"`
+	CreatedAt        time.Time `json:"created_at,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at,omitempty"`
+	LastSeenAt       time.Time `json:"last_seen_at,omitempty"`
+	UsageScore60m    float64   `json:"usage_score_60m,omitempty"`
+	Picks60m         int       `json:"picks_60m,omitempty"`
+	LastAutoMoveAt   time.Time `json:"last_auto_move_at,omitempty"`
+	LastManualMoveAt time.Time `json:"last_manual_move_at,omitempty"`
+	LastMoveReason   string    `json:"last_move_reason,omitempty"`
+	CooldownUntil    time.Time `json:"cooldown_until,omitempty"`
 }
 
 type calibrateRequest struct {
@@ -609,6 +717,9 @@ func pluginRegistration() registration {
 				{Name: "client_affinity_header", Type: pluginapi.ConfigFieldTypeString, Description: "Request header used as the stable client affinity identity."},
 				{Name: "client_affinity_group_min_size", Type: pluginapi.ConfigFieldTypeInteger, Description: "Target minimum number of auths per affinity group."},
 				{Name: "client_affinity_repeatable_auths", Type: pluginapi.ConfigFieldTypeString, Description: "Auth IDs or auth indexes allowed to appear in multiple automatic affinity groups, typically Pro accounts."},
+				{Name: "client_affinity_rebalance_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Analyze Keeper usage and rebalance idle client bindings across affinity groups."},
+				{Name: "client_affinity_rebalance_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"observe", "auto"}, Description: "Observe only or automatically apply eligible rebalance moves."},
+				{Name: "client_affinity_rebalance_usage_endpoint", Type: pluginapi.ConfigFieldTypeString, Description: "Keeper realtime usage endpoint used for 60 minute auth load snapshots."},
 			},
 		},
 		Capabilities: registrationCapabilities{
@@ -660,6 +771,12 @@ func (g *quotaGuard) configure(raw []byte) error {
 		GroupCurrent:   map[string]*groupCurrentState{},
 	}
 	g.loadErr = g.loadStateLocked()
+	if g.state.Rebalance.StartedAt.IsZero() {
+		g.state.Rebalance.StartedAt = g.now()
+	}
+	if g.state.Rebalance.Groups == nil {
+		g.state.Rebalance.Groups = map[string]groupLoadState{}
+	}
 	g.saveErr = nil
 	g.restartBackgroundRefreshLocked()
 	return nil
@@ -679,12 +796,19 @@ func (g *quotaGuard) restartBackgroundRefreshLocked() {
 		close(g.refreshStop)
 		g.refreshStop = nil
 	}
-	if !g.cfg.Enabled || !g.cfg.QuotaRefreshEnabled || g.cfg.QuotaRefreshIntervalSecs <= 0 {
+	if !g.cfg.Enabled || (!g.cfg.QuotaRefreshEnabled && !g.cfg.ClientAffinityRebalanceEnabled) {
 		return
 	}
 	stop := make(chan struct{})
 	g.refreshStop = stop
-	interval := time.Duration(g.cfg.QuotaRefreshIntervalSecs) * time.Second
+	intervalSecs := g.cfg.QuotaRefreshIntervalSecs
+	if !g.cfg.QuotaRefreshEnabled || (g.cfg.ClientAffinityRebalanceEnabled && g.cfg.ClientAffinityRebalanceIntervalSecs < intervalSecs) {
+		intervalSecs = g.cfg.ClientAffinityRebalanceIntervalSecs
+	}
+	if intervalSecs <= 0 {
+		intervalSecs = 60
+	}
+	interval := time.Duration(intervalSecs) * time.Second
 	onStartup := g.cfg.QuotaRefreshOnStartup
 	go g.backgroundRefreshLoop(interval, onStartup, stop)
 }
@@ -699,6 +823,7 @@ func (g *quotaGuard) backgroundRefreshLoop(interval time.Duration, onStartup boo
 		select {
 		case <-ticker.C:
 			g.runBackgroundRefresh()
+			g.runBackgroundRebalance(false)
 		case <-stop:
 			return
 		}
@@ -706,6 +831,12 @@ func (g *quotaGuard) backgroundRefreshLoop(interval time.Duration, onStartup boo
 }
 
 func (g *quotaGuard) runBackgroundRefresh() {
+	g.mu.Lock()
+	enabled := g.cfg.QuotaRefreshEnabled
+	g.mu.Unlock()
+	if !enabled {
+		return
+	}
 	auths, errAuths := callHostAuthList()
 	if errAuths != nil {
 		return
@@ -887,6 +1018,47 @@ func normalizeConfig(cfg pluginConfig) pluginConfig {
 		cfg.ClientAffinityGroups = map[string][]string{}
 	}
 	cfg.ClientAffinityRepeatableAuths = normalizeStringList(cfg.ClientAffinityRepeatableAuths)
+	mode := strings.ToLower(strings.TrimSpace(cfg.ClientAffinityRebalanceMode))
+	if mode != "auto" {
+		mode = "observe"
+	}
+	cfg.ClientAffinityRebalanceMode = mode
+	if strings.TrimSpace(cfg.ClientAffinityRebalanceUsageURL) == "" {
+		cfg.ClientAffinityRebalanceUsageURL = defaults.ClientAffinityRebalanceUsageURL
+	}
+	if cfg.ClientAffinityRebalanceIntervalSecs <= 0 {
+		cfg.ClientAffinityRebalanceIntervalSecs = defaults.ClientAffinityRebalanceIntervalSecs
+	}
+	if cfg.ClientAffinityRebalanceWindowMins <= 0 {
+		cfg.ClientAffinityRebalanceWindowMins = defaults.ClientAffinityRebalanceWindowMins
+	}
+	if cfg.ClientAffinityRebalanceIdleSecs <= 0 {
+		cfg.ClientAffinityRebalanceIdleSecs = defaults.ClientAffinityRebalanceIdleSecs
+	}
+	if cfg.ClientAffinityRebalanceCooldownSecs <= 0 {
+		cfg.ClientAffinityRebalanceCooldownSecs = defaults.ClientAffinityRebalanceCooldownSecs
+	}
+	if cfg.ClientAffinityManualCooldownSecs <= 0 {
+		cfg.ClientAffinityManualCooldownSecs = defaults.ClientAffinityManualCooldownSecs
+	}
+	if cfg.ClientAffinityRebalanceWarmupSecs < 0 {
+		cfg.ClientAffinityRebalanceWarmupSecs = defaults.ClientAffinityRebalanceWarmupSecs
+	}
+	if cfg.ClientAffinityRebalanceMaxMoves <= 0 {
+		cfg.ClientAffinityRebalanceMaxMoves = defaults.ClientAffinityRebalanceMaxMoves
+	}
+	if cfg.ClientAffinityRebalanceMaxMoves > 1 {
+		cfg.ClientAffinityRebalanceMaxMoves = 1
+	}
+	if cfg.ClientAffinityRebalanceMinLoadRatio <= 1 {
+		cfg.ClientAffinityRebalanceMinLoadRatio = defaults.ClientAffinityRebalanceMinLoadRatio
+	}
+	if cfg.ClientAffinityRebalanceMinImprove <= 0 {
+		cfg.ClientAffinityRebalanceMinImprove = defaults.ClientAffinityRebalanceMinImprove
+	}
+	if cfg.ClientAffinityRebalanceHistoryLimit <= 0 {
+		cfg.ClientAffinityRebalanceHistoryLimit = defaults.ClientAffinityRebalanceHistoryLimit
+	}
 	return cfg
 }
 
@@ -994,14 +1166,14 @@ func (g *quotaGuard) pickAffinityLocked(candidates []pluginapi.SchedulerAuthCand
 		return g.pickLegacyLocked(candidates, now)
 	}
 	if selected, ok := g.firstEligibleGroupCandidateLocked(members, now); ok {
-		return g.selectGroupCandidateLocked(groupID, selected, now), nil
+		return g.selectGroupCandidateLocked(groupID, clientID, selected, now), nil
 	}
 	groupID, reason, ok := g.assignAffinityGroupLocked(candidates, now)
 	if ok {
 		g.upsertClientBindingLocked(clientID, groupID, "client_header", now)
 		members = g.affinityGroupCandidatesLocked(groupID, candidates)
 		if selected, selectedOK := g.firstEligibleGroupCandidateLocked(members, now); selectedOK {
-			return g.selectGroupCandidateLocked(groupID, selected, now), nil
+			return g.selectGroupCandidateLocked(groupID, clientID, selected, now), nil
 		}
 	}
 	if g.cfg.FailWhenAllLow {
@@ -1076,10 +1248,11 @@ func (g *quotaGuard) currentGroupPrimaryCandidateLocked(groupID string, candidat
 	return pluginapi.SchedulerAuthCandidate{}, false
 }
 
-func (g *quotaGuard) selectGroupCandidateLocked(groupID string, candidate pluginapi.SchedulerAuthCandidate, now time.Time) pluginapi.SchedulerPickResponse {
+func (g *quotaGuard) selectGroupCandidateLocked(groupID, clientID string, candidate pluginapi.SchedulerAuthCandidate, now time.Time) pluginapi.SchedulerPickResponse {
 	account := g.ensureAccountLocked(candidate)
 	g.pruneInflightLocked(account, now)
-	account.Inflight = append(account.Inflight, inflightReserve{At: now})
+	account.Inflight = append(account.Inflight, inflightReserve{At: now, ClientID: clientID, GroupID: groupID, AuthID: candidate.ID})
+	g.recordClientActivityLocked(clientActivityEvent{At: now, ClientID: clientID, GroupID: groupID, AuthID: candidate.ID, Kind: "pick"})
 	g.state.GroupCurrent[groupID] = &groupCurrentState{
 		AuthID:         candidate.ID,
 		AuthIndex:      account.AuthIndex,
@@ -1706,7 +1879,7 @@ func (g *quotaGuard) applyUsage(rec pluginapi.UsageRecord) {
 	if rec.AuthIndex != "" {
 		account.AuthIndex = rec.AuthIndex
 	}
-	g.releaseInflightLocked(account)
+	reserve := g.releaseInflightLocked(account)
 	if rec.Failed && !g.cfg.CountFailedRequests {
 		g.saveErr = g.saveStateLocked()
 		return
@@ -1719,6 +1892,9 @@ func (g *quotaGuard) applyUsage(rec pluginapi.UsageRecord) {
 		}
 		account.Events = append(account.Events, usageEvent{At: eventAt, Score: score, Model: rec.Model, Failed: rec.Failed})
 		account.LastUsageAt = eventAt
+		if reserve.ClientID != "" && reserve.GroupID != "" {
+			g.recordClientActivityLocked(clientActivityEvent{At: eventAt, ClientID: reserve.ClientID, GroupID: reserve.GroupID, AuthID: firstNonEmpty(reserve.AuthID, account.AuthID), Kind: "usage", Score: score})
+		}
 	}
 	g.saveErr = g.saveStateLocked()
 }
@@ -1936,11 +2112,42 @@ func (g *quotaGuard) pruneInflightLocked(account *accountState, now time.Time) {
 	account.Inflight = kept
 }
 
-func (g *quotaGuard) releaseInflightLocked(account *accountState) {
+func (g *quotaGuard) releaseInflightLocked(account *accountState) inflightReserve {
 	if len(account.Inflight) == 0 {
+		return inflightReserve{}
+	}
+	reserve := account.Inflight[0]
+	account.Inflight = account.Inflight[1:]
+	return reserve
+}
+
+func (g *quotaGuard) recordClientActivityLocked(event clientActivityEvent) {
+	if strings.TrimSpace(event.ClientID) == "" || strings.TrimSpace(event.GroupID) == "" {
 		return
 	}
-	account.Inflight = account.Inflight[1:]
+	g.state.ClientActivity = append(g.state.ClientActivity, event)
+	g.pruneClientActivityLocked(g.now())
+}
+
+func (g *quotaGuard) pruneClientActivityLocked(now time.Time) {
+	retention := time.Duration(g.cfg.ClientAffinityRebalanceWindowMins) * time.Minute
+	if cooldown := time.Duration(g.cfg.ClientAffinityRebalanceCooldownSecs) * time.Second; cooldown > retention {
+		retention = cooldown
+	}
+	if manual := time.Duration(g.cfg.ClientAffinityManualCooldownSecs) * time.Second; manual > retention {
+		retention = manual
+	}
+	if retention <= 0 {
+		retention = 24 * time.Hour
+	}
+	cutoff := now.Add(-retention)
+	kept := g.state.ClientActivity[:0]
+	for _, event := range g.state.ClientActivity {
+		if event.At.IsZero() || !event.At.Before(cutoff) {
+			kept = append(kept, event)
+		}
+	}
+	g.state.ClientActivity = kept
 }
 
 func (g *quotaGuard) calibrate(req calibrateRequest) error {
@@ -2074,6 +2281,12 @@ func (g *quotaGuard) loadStateLocked() error {
 	}
 	if loaded.GroupCurrent == nil {
 		loaded.GroupCurrent = map[string]*groupCurrentState{}
+	}
+	if loaded.Rebalance.Groups == nil {
+		loaded.Rebalance.Groups = map[string]groupLoadState{}
+	}
+	if loaded.Rebalance.StartedAt.IsZero() {
+		loaded.Rebalance.StartedAt = g.now()
 	}
 	for key, account := range loaded.Accounts {
 		if account == nil {
@@ -2280,6 +2493,7 @@ func (g *quotaGuard) affinitySnapshotLocked(now time.Time) affinitySnapshot {
 		Header:            g.cfg.ClientAffinityHeader,
 		LegacyWhenMissing: true,
 		GroupMinSize:      g.cfg.ClientAffinityGroupMinSize,
+		Rebalance:         g.state.Rebalance,
 	}
 	groupIDs := make([]string, 0, len(g.state.Groups))
 	for groupID := range g.state.Groups {
@@ -2301,6 +2515,7 @@ func (g *quotaGuard) affinitySnapshotLocked(now time.Time) affinitySnapshot {
 			lastSelectedAt = current.LastSelectedAt
 		}
 		eligible, reason := g.affinityGroupEligibleFromStateLocked(groupID, now)
+		load := g.state.Rebalance.Groups[groupID]
 		out.Groups = append(out.Groups, affinityGroupSnapshot{
 			ID:               group.ID,
 			Members:          append([]string(nil), group.Members...),
@@ -2314,6 +2529,11 @@ func (g *quotaGuard) affinitySnapshotLocked(now time.Time) affinitySnapshot {
 			Eligible:         eligible,
 			Reason:           reason,
 			BindingCount:     g.affinityBindingCountLocked(groupID),
+			Tokens60m:        round2(load.Tokens),
+			ActualShare:      round2(load.ActualShare),
+			TargetShare:      round2(load.TargetShare),
+			LoadFactor:       round2(load.LoadFactor),
+			MainCapacity:     round2(load.Capacity),
 		})
 	}
 	bindings := make([]*clientBindingState, 0, len(g.state.ClientBindings))
@@ -2332,13 +2552,42 @@ func (g *quotaGuard) affinitySnapshotLocked(now time.Time) affinitySnapshot {
 		return left.ClientID < right.ClientID
 	})
 	for _, binding := range bindings {
+		usageScore := 0.0
+		picks := 0
+		windowStart := now.Add(-time.Duration(g.cfg.ClientAffinityRebalanceWindowMins) * time.Minute)
+		for _, event := range g.state.ClientActivity {
+			if event.ClientID != binding.ClientID || event.At.Before(windowStart) {
+				continue
+			}
+			if event.Kind == "usage" {
+				usageScore += event.Score
+			} else if event.Kind == "pick" {
+				picks++
+			}
+		}
+		cooldownUntil := time.Time{}
+		if !binding.LastAutoMoveAt.IsZero() {
+			cooldownUntil = binding.LastAutoMoveAt.Add(time.Duration(g.cfg.ClientAffinityRebalanceCooldownSecs) * time.Second)
+		}
+		if !binding.LastManualMoveAt.IsZero() {
+			manualUntil := binding.LastManualMoveAt.Add(time.Duration(g.cfg.ClientAffinityManualCooldownSecs) * time.Second)
+			if manualUntil.After(cooldownUntil) {
+				cooldownUntil = manualUntil
+			}
+		}
 		out.Bindings = append(out.Bindings, clientBindingSnapshot{
-			ClientID:   binding.ClientID,
-			GroupID:    binding.GroupID,
-			Source:     binding.Source,
-			CreatedAt:  binding.CreatedAt,
-			UpdatedAt:  binding.UpdatedAt,
-			LastSeenAt: binding.LastSeenAt,
+			ClientID:         binding.ClientID,
+			GroupID:          binding.GroupID,
+			Source:           binding.Source,
+			CreatedAt:        binding.CreatedAt,
+			UpdatedAt:        binding.UpdatedAt,
+			LastSeenAt:       binding.LastSeenAt,
+			UsageScore60m:    round2(usageScore),
+			Picks60m:         picks,
+			LastAutoMoveAt:   binding.LastAutoMoveAt,
+			LastManualMoveAt: binding.LastManualMoveAt,
+			LastMoveReason:   binding.LastMoveReason,
+			CooldownUntil:    cooldownUntil,
 		})
 	}
 	return out
@@ -3127,6 +3376,18 @@ func (g *quotaGuard) handleResourceAction(action string, query url.Values) ([]by
 			return okEnvelope(jsonResponse(http.StatusBadRequest, map[string]string{"error": errMove.Error()}))
 		}
 		return okEnvelope(jsonResponse(http.StatusOK, map[string]any{"status": "ok", "moved": moved, "skipped": skipped}))
+	case "rebalance-analyze":
+		entry, errAnalyze := g.runRebalanceNow(false)
+		if errAnalyze != nil {
+			return okEnvelope(jsonResponse(http.StatusBadGateway, map[string]any{"status": "error", "error": errAnalyze.Error(), "analysis": entry}))
+		}
+		return okEnvelope(jsonResponse(http.StatusOK, map[string]any{"status": "ok", "analysis": entry}))
+	case "rebalance-once":
+		entry, errRebalance := g.runRebalanceNow(true)
+		if errRebalance != nil {
+			return okEnvelope(jsonResponse(http.StatusBadGateway, map[string]any{"status": "error", "error": errRebalance.Error(), "analysis": entry}))
+		}
+		return okEnvelope(jsonResponse(http.StatusOK, map[string]any{"status": "ok", "analysis": entry}))
 	default:
 		return okEnvelope(jsonResponse(http.StatusBadRequest, map[string]string{"error": "unknown resource action"}))
 	}
@@ -3259,9 +3520,13 @@ func (g *quotaGuard) moveClientBindings(clientIDs []string, groupID string) ([]s
 			skipped = append(skipped, clientID)
 			continue
 		}
+		oldGroupID := binding.GroupID
 		binding.GroupID = groupID
 		binding.UpdatedAt = now
 		binding.LastSeenAt = now
+		binding.LastManualMoveAt = now
+		binding.LastMoveReason = "manual move from " + firstNonEmpty(oldGroupID, "unknown") + " to " + groupID
+		g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "manual", Result: "moved", ClientID: clientID, FromGroup: oldGroupID, ToGroup: groupID, Reason: binding.LastMoveReason})
 		moved = append(moved, clientID)
 	}
 	if len(moved) == 0 && len(skipped) == 0 {
@@ -3269,6 +3534,408 @@ func (g *quotaGuard) moveClientBindings(clientIDs []string, groupID string) ([]s
 	}
 	g.saveErr = g.saveStateLocked()
 	return moved, skipped, g.saveErr
+}
+
+type keeperRealtimeUsageResponse struct {
+	Window       string    `json:"window"`
+	WindowStart  time.Time `json:"window_start"`
+	WindowEnd    time.Time `json:"window_end"`
+	CurrentUsage struct {
+		AuthFiles []struct {
+			Key      string  `json:"key"`
+			Label    string  `json:"label"`
+			Tokens   float64 `json:"tokens"`
+			Requests int64   `json:"requests"`
+			Share    float64 `json:"share"`
+		} `json:"auth_files"`
+	} `json:"current_usage"`
+}
+
+func (g *quotaGuard) runBackgroundRebalance(force bool) {
+	g.mu.Lock()
+	cfg := g.cfg
+	now := g.now()
+	due := force || g.state.Rebalance.LastAnalysisAt.IsZero() || now.Sub(g.state.Rebalance.LastAnalysisAt) >= time.Duration(cfg.ClientAffinityRebalanceIntervalSecs)*time.Second
+	g.mu.Unlock()
+	if !cfg.Enabled || !cfg.ClientAffinityEnabled || !cfg.ClientAffinityRebalanceEnabled || !due {
+		return
+	}
+	_, _ = g.runRebalanceNow(force)
+}
+
+func (g *quotaGuard) runRebalanceNow(forceApply bool) (rebalanceHistoryEntry, error) {
+	g.mu.Lock()
+	cfg := g.cfg
+	now := g.now()
+	g.mu.Unlock()
+	if auths, errAuths := callHostAuthList(); errAuths == nil {
+		for _, req := range g.rebalanceQuotaRefreshRequests(auths.Files, now) {
+			g.refreshQuotaSnapshots(auths.Files, req)
+		}
+	}
+	snapshot, errFetch := fetchKeeperUsageSnapshot(cfg.ClientAffinityRebalanceUsageURL, now)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if errFetch != nil {
+		entry := g.recordRebalanceFailureLocked(now, "keeper usage unavailable: "+errFetch.Error())
+		g.saveErr = g.saveStateLocked()
+		return entry, errFetch
+	}
+	entry := g.analyzeRebalanceLocked(snapshot, forceApply)
+	g.saveErr = g.saveStateLocked()
+	return entry, g.saveErr
+}
+
+func (g *quotaGuard) rebalanceQuotaRefreshRequests(files []pluginapi.HostAuthFileEntry, now time.Time) []refreshRequest {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, file := range files {
+		key := strings.TrimSpace(firstNonEmpty(file.ID, file.AuthIndex))
+		if key == "" {
+			continue
+		}
+		applyHostAuthFile(g.ensureAccountByKeyLocked(key), file)
+	}
+	g.rebuildAffinityGroupsLocked(g.affinitySnapshotCandidatesLocked(), now)
+	requests := make([]refreshRequest, 0, len(g.state.Groups))
+	seen := map[string]bool{}
+	for _, group := range g.state.Groups {
+		if group == nil || strings.TrimSpace(group.MainAuthID) == "" || seen[group.MainAuthID] {
+			continue
+		}
+		account := g.ensureAccountByKeyLocked(group.MainAuthID)
+		if len(account.QuotaSnapshots) > 0 && !quotaSnapshotsStale(account, now, g.cfg) {
+			continue
+		}
+		seen[group.MainAuthID] = true
+		requests = append(requests, refreshRequest{AuthID: account.AuthID, AuthIndex: account.AuthIndex})
+	}
+	return requests
+}
+
+func fetchKeeperUsageSnapshot(endpoint string, now time.Time) (keeperUsageSnapshot, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return keeperUsageSnapshot{}, fmt.Errorf("usage endpoint is required")
+	}
+	result, errCall := callHostFunc(pluginabi.MethodHostHTTPDo, pluginapi.HTTPRequest{
+		Method:  http.MethodGet,
+		URL:     endpoint,
+		Headers: http.Header{"accept": []string{contentTypeJSON}},
+	})
+	if errCall != nil {
+		return keeperUsageSnapshot{}, errCall
+	}
+	var resp pluginapi.HTTPResponse
+	if errUnmarshal := json.Unmarshal(result, &resp); errUnmarshal != nil {
+		return keeperUsageSnapshot{}, fmt.Errorf("decode keeper usage response: %w", errUnmarshal)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return keeperUsageSnapshot{}, fmt.Errorf("keeper usage returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(resp.Body)))
+	}
+	var payload keeperRealtimeUsageResponse
+	if errUnmarshal := json.Unmarshal(resp.Body, &payload); errUnmarshal != nil {
+		return keeperUsageSnapshot{}, fmt.Errorf("decode keeper usage payload: %w", errUnmarshal)
+	}
+	if payload.WindowEnd.IsZero() || now.Sub(payload.WindowEnd) > 5*time.Minute || payload.WindowEnd.After(now.Add(5*time.Minute)) {
+		return keeperUsageSnapshot{}, fmt.Errorf("keeper usage snapshot is stale")
+	}
+	if len(payload.CurrentUsage.AuthFiles) == 0 {
+		return keeperUsageSnapshot{}, fmt.Errorf("keeper usage has no auth_files")
+	}
+	snapshot := keeperUsageSnapshot{WindowStart: payload.WindowStart, WindowEnd: payload.WindowEnd, FetchedAt: now, AuthFiles: map[string]keeperUsageItem{}}
+	for _, item := range payload.CurrentUsage.AuthFiles {
+		key := strings.TrimSpace(item.Key)
+		if key == "" {
+			continue
+		}
+		snapshot.AuthFiles[key] = keeperUsageItem{AuthIndex: key, Label: item.Label, Tokens: math.Max(0, item.Tokens), Requests: item.Requests, Share: item.Share}
+	}
+	if len(snapshot.AuthFiles) == 0 {
+		return keeperUsageSnapshot{}, fmt.Errorf("keeper usage has no usable auth_files")
+	}
+	return snapshot, nil
+}
+
+type bindingLoadEstimate struct {
+	ClientID string
+	Tokens   float64
+	Idle     time.Duration
+}
+
+func (g *quotaGuard) analyzeRebalanceLocked(snapshot keeperUsageSnapshot, forceApply bool) rebalanceHistoryEntry {
+	now := g.now()
+	g.ensureAffinityStateLocked()
+	g.pruneClientActivityLocked(now)
+	g.rebuildAffinityGroupsLocked(g.affinitySnapshotCandidatesLocked(), now)
+	g.state.Rebalance.LastAnalysisAt = now
+	g.state.Rebalance.KeeperUsage = snapshot
+	g.state.Rebalance.LastError = ""
+	loads, errLoads := g.buildGroupLoadsLocked(snapshot, now)
+	if errLoads != nil {
+		return g.recordRebalanceFailureLocked(now, errLoads.Error())
+	}
+	g.state.Rebalance.Groups = loads
+	if now.Sub(g.state.Rebalance.StartedAt) < time.Duration(g.cfg.ClientAffinityRebalanceWarmupSecs)*time.Second {
+		return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "observed", Reason: "warmup period is still active"})
+	}
+	source, target, ok := selectRebalanceGroups(loads)
+	if !ok {
+		return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "skipped", Reason: "fewer than two eligible groups have load data"})
+	}
+	ratio := math.Inf(1)
+	if target.LoadFactor > 0 {
+		ratio = source.LoadFactor / target.LoadFactor
+	}
+	if ratio < g.cfg.ClientAffinityRebalanceMinLoadRatio {
+		return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "skipped", FromGroup: source.GroupID, ToGroup: target.GroupID, Reason: fmt.Sprintf("load ratio %.2f is below %.2f", ratio, g.cfg.ClientAffinityRebalanceMinLoadRatio), SourceTokens: source.Tokens, TargetTokens: target.Tokens, SourceLoadFactor: source.LoadFactor, TargetLoadFactor: target.LoadFactor})
+	}
+	candidate, improvement, ok := g.bestRebalanceBindingLocked(source, target, loads, snapshot.WindowStart, now)
+	if !ok {
+		return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "deferred", FromGroup: source.GroupID, ToGroup: target.GroupID, Reason: "no recently used binding is idle and outside cooldown", SourceTokens: source.Tokens, TargetTokens: target.Tokens, SourceLoadFactor: source.LoadFactor, TargetLoadFactor: target.LoadFactor})
+	}
+	entry := rebalanceHistoryEntry{At: now, Action: "analyze", Result: "recommended", ClientID: candidate.ClientID, FromGroup: source.GroupID, ToGroup: target.GroupID, Reason: "capacity-normalized Keeper load is imbalanced", SourceTokens: source.Tokens, TargetTokens: target.Tokens, SourceLoadFactor: source.LoadFactor, TargetLoadFactor: target.LoadFactor, IdleSeconds: int64(candidate.Idle.Seconds()), EstimatedTokens: candidate.Tokens, ImprovementPercent: improvement}
+	if improvement < g.cfg.ClientAffinityRebalanceMinImprove {
+		entry.Result = "skipped"
+		entry.Reason = fmt.Sprintf("predicted improvement %.2f%% is below %.2f%%", improvement, g.cfg.ClientAffinityRebalanceMinImprove)
+		return g.appendRebalanceHistoryLocked(entry)
+	}
+	apply := forceApply || g.cfg.ClientAffinityRebalanceMode == "auto"
+	if !apply {
+		return g.appendRebalanceHistoryLocked(entry)
+	}
+	binding := g.state.ClientBindings[candidate.ClientID]
+	if binding == nil || binding.GroupID != source.GroupID {
+		entry.Result = "skipped"
+		entry.Reason = "binding changed during analysis"
+		return g.appendRebalanceHistoryLocked(entry)
+	}
+	binding.GroupID = target.GroupID
+	binding.UpdatedAt = now
+	binding.LastAutoMoveAt = now
+	binding.LastMoveReason = fmt.Sprintf("auto rebalance %.2f%% improvement from %s to %s", improvement, source.GroupID, target.GroupID)
+	entry.Action = "auto"
+	if forceApply {
+		entry.Action = "manual-rebalance"
+	}
+	entry.Result = "moved"
+	entry.Reason = binding.LastMoveReason
+	return g.appendRebalanceHistoryLocked(entry)
+}
+
+func (g *quotaGuard) buildGroupLoadsLocked(snapshot keeperUsageSnapshot, now time.Time) (map[string]groupLoadState, error) {
+	loads := map[string]groupLoadState{}
+	authGroups := map[string][]string{}
+	totalCapacity := 0.0
+	for groupID, group := range g.state.Groups {
+		if group == nil || strings.TrimSpace(group.MainAuthID) == "" {
+			continue
+		}
+		main := g.ensureAccountByKeyLocked(group.MainAuthID)
+		capacity := g.accountAffinityWeightLocked(main, now)
+		eligible, reason := g.affinityGroupEligibleFromStateLocked(groupID, now)
+		loads[groupID] = groupLoadState{GroupID: groupID, Capacity: capacity, Eligible: eligible, Reason: reason}
+		if eligible {
+			totalCapacity += capacity
+		}
+		for _, member := range group.Members {
+			account := g.ensureAccountByKeyLocked(member)
+			if account.AuthIndex != "" {
+				authGroups[account.AuthIndex] = append(authGroups[account.AuthIndex], groupID)
+			}
+		}
+	}
+	if totalCapacity <= 0 {
+		return nil, fmt.Errorf("no eligible group capacity")
+	}
+	windowStart := snapshot.WindowStart
+	for authIndex, usage := range snapshot.AuthFiles {
+		groups := normalizeStringList(authGroups[authIndex])
+		if len(groups) == 0 {
+			continue
+		}
+		if len(groups) == 1 {
+			load := loads[groups[0]]
+			load.Tokens += usage.Tokens
+			load.Requests += float64(usage.Requests)
+			loads[groups[0]] = load
+			continue
+		}
+		pickCounts := map[string]float64{}
+		totalPicks := 0.0
+		for _, event := range g.state.ClientActivity {
+			if event.Kind != "pick" || event.AuthID == "" || event.At.Before(windowStart) {
+				continue
+			}
+			account := g.ensureAccountByKeyLocked(event.AuthID)
+			if account.AuthIndex == authIndex {
+				pickCounts[event.GroupID]++
+				totalPicks++
+			}
+		}
+		if usage.Tokens > 0 && totalPicks == 0 {
+			return nil, fmt.Errorf("shared auth %s usage cannot be attributed to groups", authIndex)
+		}
+		for _, groupID := range groups {
+			share := 0.0
+			if totalPicks > 0 {
+				share = pickCounts[groupID] / totalPicks
+			}
+			load := loads[groupID]
+			load.Tokens += usage.Tokens * share
+			load.Requests += float64(usage.Requests) * share
+			loads[groupID] = load
+		}
+	}
+	totalTokens := 0.0
+	for _, load := range loads {
+		totalTokens += load.Tokens
+	}
+	for groupID, load := range loads {
+		if load.Eligible {
+			load.TargetShare = load.Capacity / totalCapacity * 100
+		}
+		if totalTokens > 0 {
+			load.ActualShare = load.Tokens / totalTokens * 100
+		}
+		if load.TargetShare > 0 {
+			load.LoadFactor = load.ActualShare / load.TargetShare
+		}
+		loads[groupID] = load
+	}
+	return loads, nil
+}
+
+func selectRebalanceGroups(loads map[string]groupLoadState) (groupLoadState, groupLoadState, bool) {
+	var source, target groupLoadState
+	set := false
+	for _, load := range loads {
+		if !load.Eligible || load.Capacity <= 0 {
+			continue
+		}
+		if !set {
+			source, target, set = load, load, true
+			continue
+		}
+		if load.LoadFactor > source.LoadFactor || (load.LoadFactor == source.LoadFactor && load.GroupID < source.GroupID) {
+			source = load
+		}
+		if load.LoadFactor < target.LoadFactor || (load.LoadFactor == target.LoadFactor && load.GroupID < target.GroupID) {
+			target = load
+		}
+	}
+	return source, target, set && source.GroupID != target.GroupID
+}
+
+func (g *quotaGuard) bestRebalanceBindingLocked(source, target groupLoadState, loads map[string]groupLoadState, windowStart, now time.Time) (bindingLoadEstimate, float64, bool) {
+	idleThreshold := time.Duration(g.cfg.ClientAffinityRebalanceIdleSecs) * time.Second
+	autoCooldown := time.Duration(g.cfg.ClientAffinityRebalanceCooldownSecs) * time.Second
+	manualCooldown := time.Duration(g.cfg.ClientAffinityManualCooldownSecs) * time.Second
+	type activityTotal struct{ score, picks float64 }
+	clientTotals := map[string]activityTotal{}
+	groupTotal := activityTotal{}
+	for _, event := range g.state.ClientActivity {
+		if event.GroupID != source.GroupID || event.At.Before(windowStart) {
+			continue
+		}
+		total := clientTotals[event.ClientID]
+		if event.Kind == "usage" {
+			total.score += event.Score
+			groupTotal.score += event.Score
+		} else if event.Kind == "pick" {
+			total.picks++
+			groupTotal.picks++
+		}
+		clientTotals[event.ClientID] = total
+	}
+	beforeSpread := rebalanceLoadSpread(loads)
+	bestImprove := -1.0
+	best := bindingLoadEstimate{}
+	for clientID, binding := range g.state.ClientBindings {
+		if binding == nil || binding.GroupID != source.GroupID || binding.LastSeenAt.Before(windowStart) {
+			continue
+		}
+		idle := now.Sub(binding.LastSeenAt)
+		if idle < idleThreshold || (!binding.LastAutoMoveAt.IsZero() && now.Sub(binding.LastAutoMoveAt) < autoCooldown) || (!binding.LastManualMoveAt.IsZero() && now.Sub(binding.LastManualMoveAt) < manualCooldown) {
+			continue
+		}
+		total := clientTotals[clientID]
+		estimated := 0.0
+		if groupTotal.score > 0 && total.score > 0 {
+			estimated = source.Tokens * total.score / groupTotal.score
+		} else if groupTotal.picks > 0 && total.picks > 0 {
+			estimated = source.Tokens * total.picks / groupTotal.picks
+		}
+		if estimated <= 0 || estimated > source.Tokens {
+			continue
+		}
+		simulated := make(map[string]groupLoadState, len(loads))
+		for id, load := range loads {
+			simulated[id] = load
+		}
+		sourceAfter := simulated[source.GroupID]
+		targetAfter := simulated[target.GroupID]
+		sourceAfter.Tokens -= estimated
+		targetAfter.Tokens += estimated
+		simulated[source.GroupID] = sourceAfter
+		simulated[target.GroupID] = targetAfter
+		totalTokens := 0.0
+		for _, load := range simulated {
+			totalTokens += load.Tokens
+		}
+		for id, load := range simulated {
+			if totalTokens > 0 {
+				load.ActualShare = load.Tokens / totalTokens * 100
+			}
+			if load.TargetShare > 0 {
+				load.LoadFactor = load.ActualShare / load.TargetShare
+			}
+			simulated[id] = load
+		}
+		improvement := 0.0
+		if beforeSpread > 0 {
+			improvement = (beforeSpread - rebalanceLoadSpread(simulated)) / beforeSpread * 100
+		}
+		if improvement > bestImprove || (improvement == bestImprove && clientID < best.ClientID) {
+			bestImprove = improvement
+			best = bindingLoadEstimate{ClientID: clientID, Tokens: estimated, Idle: idle}
+		}
+	}
+	return best, round2(bestImprove), bestImprove >= 0
+}
+
+func rebalanceLoadSpread(loads map[string]groupLoadState) float64 {
+	minLoad := math.Inf(1)
+	maxLoad := 0.0
+	for _, load := range loads {
+		if !load.Eligible {
+			continue
+		}
+		minLoad = math.Min(minLoad, load.LoadFactor)
+		maxLoad = math.Max(maxLoad, load.LoadFactor)
+	}
+	if math.IsInf(minLoad, 1) {
+		return 0
+	}
+	return maxLoad - minLoad
+}
+
+func (g *quotaGuard) recordRebalanceFailureLocked(now time.Time, reason string) rebalanceHistoryEntry {
+	g.state.Rebalance.LastAnalysisAt = now
+	g.state.Rebalance.LastError = reason
+	return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "error", Reason: reason})
+}
+
+func (g *quotaGuard) appendRebalanceHistoryLocked(entry rebalanceHistoryEntry) rebalanceHistoryEntry {
+	g.state.Rebalance.History = append(g.state.Rebalance.History, entry)
+	limit := g.cfg.ClientAffinityRebalanceHistoryLimit
+	if limit <= 0 {
+		limit = 200
+	}
+	if len(g.state.Rebalance.History) > limit {
+		g.state.Rebalance.History = append([]rebalanceHistoryEntry(nil), g.state.Rebalance.History[len(g.state.Rebalance.History)-limit:]...)
+	}
+	return entry
 }
 
 func (g *quotaGuard) deleteLocalAccountState(authID, authIndex string, files []pluginapi.HostAuthFileEntry) error {
@@ -3464,6 +4131,58 @@ func (g *quotaGuard) handleConfigPatch(raw []byte) ([]byte, error) {
 		case "resource_actions_require_management_key":
 			if v, ok := value.(bool); ok {
 				cfg.ResourceActionsRequireManagementKey = v
+			}
+		case "client_affinity_rebalance_enabled":
+			if v, ok := value.(bool); ok {
+				cfg.ClientAffinityRebalanceEnabled = v
+			}
+		case "client_affinity_rebalance_mode":
+			if v, ok := value.(string); ok {
+				cfg.ClientAffinityRebalanceMode = v
+			}
+		case "client_affinity_rebalance_usage_endpoint":
+			if v, ok := value.(string); ok {
+				cfg.ClientAffinityRebalanceUsageURL = v
+			}
+		case "client_affinity_rebalance_interval_seconds":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceIntervalSecs = int64(v)
+			}
+		case "client_affinity_rebalance_window_minutes":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceWindowMins = int64(v)
+			}
+		case "client_affinity_rebalance_idle_seconds":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceIdleSecs = int64(v)
+			}
+		case "client_affinity_rebalance_cooldown_seconds":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceCooldownSecs = int64(v)
+			}
+		case "client_affinity_manual_move_cooldown_seconds":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityManualCooldownSecs = int64(v)
+			}
+		case "client_affinity_rebalance_warmup_seconds":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceWarmupSecs = int64(v)
+			}
+		case "client_affinity_rebalance_max_moves_per_cycle":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceMaxMoves = int(v)
+			}
+		case "client_affinity_rebalance_min_load_ratio":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceMinLoadRatio = v
+			}
+		case "client_affinity_rebalance_min_improvement_percent":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceMinImprove = v
+			}
+		case "client_affinity_rebalance_history_limit":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceHistoryLimit = int(v)
 			}
 		}
 	}
@@ -3985,9 +4704,22 @@ func renderAffinitySection(out *bytes.Buffer, affinity affinitySnapshot, account
 	out.WriteString(html.EscapeString(firstNonEmpty(affinity.Header, "X-CPA-Client-ID")))
 	out.WriteString("</code> <span class=\"muted\">missing header uses legacy/global primary</span></p>")
 	out.WriteString("<p class=\"muted\">Weight is the summed estimated capacity score for a group. New clients are assigned by binding count divided by weight; auto groups select the main Plus/Team account first and use Pro/repeatable members only as backups.</p>")
+	if affinity.Rebalance.LastAnalysisAt.IsZero() {
+		out.WriteString("<p class=\"muted\">Rebalance has not collected a Keeper usage snapshot yet.</p>")
+	} else {
+		out.WriteString("<p class=\"muted\">Rebalance ")
+		out.WriteString(html.EscapeString(affinity.Rebalance.LastAnalysisAt.Format(time.RFC3339)))
+		if affinity.Rebalance.LastError != "" {
+			out.WriteString(" · <span class=\"low\">")
+			out.WriteString(html.EscapeString(affinity.Rebalance.LastError))
+			out.WriteString("</span>")
+		}
+		out.WriteString("</p>")
+	}
+	out.WriteString("<div class=\"toolbar\"><button class=\"secondary\" id=\"quota-guard-rebalance-analyze\">Analyze Now</button><button class=\"secondary\" id=\"quota-guard-rebalance-once\">Rebalance Once</button></div>")
 	renderManualGroupEditor(out, accounts)
 	if len(affinity.Groups) > 0 {
-		out.WriteString("<table><thead><tr><th>Group</th><th>Members</th><th>Current</th><th>Status</th><th>Bindings</th><th>Action</th></tr></thead><tbody>")
+		out.WriteString("<table><thead><tr><th>Group</th><th>Members</th><th>Current</th><th>Status</th><th>60m Load</th><th>Bindings</th><th>Action</th></tr></thead><tbody>")
 		for _, group := range affinity.Groups {
 			out.WriteString("<tr><td><code>")
 			out.WriteString(html.EscapeString(group.ID))
@@ -4032,6 +4764,17 @@ func renderAffinitySection(out *bytes.Buffer, affinity affinitySnapshot, account
 				out.WriteString(html.EscapeString(group.Reason))
 				out.WriteString("</span>")
 			}
+			out.WriteString("</td><td class=\"nowrap\">")
+			out.WriteString(formatScore(group.Tokens60m))
+			out.WriteString("<br><span class=\"muted\">actual ")
+			out.WriteString(fmt.Sprintf("%.2f%%", group.ActualShare))
+			out.WriteString(" · target ")
+			out.WriteString(fmt.Sprintf("%.2f%%", group.TargetShare))
+			out.WriteString("<br>factor ")
+			out.WriteString(fmt.Sprintf("%.2fx", group.LoadFactor))
+			out.WriteString(" · capacity ")
+			out.WriteString(formatScore(group.MainCapacity))
+			out.WriteString("</span>")
 			out.WriteString("</td><td>")
 			out.WriteString(strconv.Itoa(group.BindingCount))
 			out.WriteString("</td><td>")
@@ -4070,7 +4813,7 @@ func renderAffinitySection(out *bytes.Buffer, affinity affinitySnapshot, account
 			out.WriteString(strconv.Itoa(group.BindingCount))
 			out.WriteString(")</option>")
 		}
-		out.WriteString("</select><button class=\"secondary\" id=\"quota-guard-move-bindings\">Move Selected</button></div><table><thead><tr><th><input type=\"checkbox\" id=\"quota-guard-bindings-all\"></th><th>Client</th><th>Group</th><th>Source</th><th>Last Seen</th></tr></thead><tbody>")
+		out.WriteString("</select><button class=\"secondary\" id=\"quota-guard-move-bindings\">Move Selected</button></div><table><thead><tr><th><input type=\"checkbox\" id=\"quota-guard-bindings-all\"></th><th>Client</th><th>Group</th><th>60m Activity</th><th>Last Seen</th><th>Move State</th></tr></thead><tbody>")
 		for _, binding := range affinity.Bindings {
 			out.WriteString("<tr><td><input type=\"checkbox\" name=\"quota-guard-client-binding\" value=\"")
 			out.WriteString(html.EscapeString(binding.ClientID))
@@ -4078,13 +4821,36 @@ func renderAffinitySection(out *bytes.Buffer, affinity affinitySnapshot, account
 			out.WriteString(html.EscapeString(binding.ClientID))
 			out.WriteString("</code></td><td><code>")
 			out.WriteString(html.EscapeString(binding.GroupID))
-			out.WriteString("</code></td><td>")
-			out.WriteString(html.EscapeString(binding.Source))
-			out.WriteString("</td><td>")
+			out.WriteString("</code></td><td class=\"nowrap\">")
+			out.WriteString(strconv.Itoa(binding.Picks60m))
+			out.WriteString(" picks<br><span class=\"muted\">")
+			out.WriteString(formatScore(binding.UsageScore60m))
+			out.WriteString(" local score</span></td><td>")
 			if !binding.LastSeenAt.IsZero() {
 				out.WriteString(html.EscapeString(binding.LastSeenAt.Format(time.RFC3339)))
 			}
+			out.WriteString("</td><td class=\"tight\">")
+			if !binding.CooldownUntil.IsZero() && binding.CooldownUntil.After(time.Now()) {
+				out.WriteString("<span class=\"pill\">cooldown</span><br><span class=\"muted\">")
+				out.WriteString(html.EscapeString(binding.CooldownUntil.Format("01-02 15:04")))
+				out.WriteString("</span>")
+			} else {
+				out.WriteString("<span class=\"pill good\">movable when idle</span>")
+			}
+			if binding.LastMoveReason != "" {
+				out.WriteString("<br><span class=\"muted\">")
+				out.WriteString(html.EscapeString(binding.LastMoveReason))
+				out.WriteString("</span>")
+			}
 			out.WriteString("</td></tr>")
+		}
+		out.WriteString("</tbody></table></details>")
+	}
+	if len(affinity.Rebalance.History) > 0 {
+		out.WriteString("<details><summary>Rebalance History (" + strconv.Itoa(len(affinity.Rebalance.History)) + ")</summary><table><thead><tr><th>Time</th><th>Result</th><th>Client</th><th>Route</th><th>Reason</th></tr></thead><tbody>")
+		for i := len(affinity.Rebalance.History) - 1; i >= 0 && i >= len(affinity.Rebalance.History)-50; i-- {
+			entry := affinity.Rebalance.History[i]
+			out.WriteString("<tr><td class=\"nowrap\">" + html.EscapeString(entry.At.Format("01-02 15:04")) + "</td><td>" + html.EscapeString(entry.Action+" / "+entry.Result) + "</td><td><code>" + html.EscapeString(entry.ClientID) + "</code></td><td><code>" + html.EscapeString(entry.FromGroup) + "</code> → <code>" + html.EscapeString(entry.ToGroup) + "</code></td><td>" + html.EscapeString(entry.Reason) + "</td></tr>")
 		}
 		out.WriteString("</tbody></table></details>")
 	}
@@ -4215,6 +4981,8 @@ const quotaGuardStatusScript = `<script>
   const deleteBindings = document.getElementById("quota-guard-delete-bindings");
   const moveBindings = document.getElementById("quota-guard-move-bindings");
   const moveTarget = document.getElementById("quota-guard-move-target");
+  const analyzeRebalance = document.getElementById("quota-guard-rebalance-analyze");
+  const rebalanceOnce = document.getElementById("quota-guard-rebalance-once");
   async function action(data) {
     const params = new URLSearchParams();
     Object.keys(data || {}).forEach(function(key) {
@@ -4246,6 +5014,27 @@ const quotaGuardStatusScript = `<script>
     }
   }
   if (refreshAll) refreshAll.addEventListener("click", function(){ refresh({all:true, force:true}); });
+  if (analyzeRebalance) analyzeRebalance.addEventListener("click", async function() {
+    message.textContent = "Analyzing Keeper usage...";
+    try {
+      await action({action:"rebalance-analyze"});
+      message.textContent = "Rebalance analysis completed.";
+      setTimeout(function(){ location.reload(); }, 400);
+    } catch (err) {
+      message.textContent = err.message;
+    }
+  });
+  if (rebalanceOnce) rebalanceOnce.addEventListener("click", async function() {
+    if (!confirm("Run one guarded rebalance move if an eligible idle client is found?")) return;
+    message.textContent = "Running guarded rebalance...";
+    try {
+      await action({action:"rebalance-once"});
+      message.textContent = "Rebalance cycle completed.";
+      setTimeout(function(){ location.reload(); }, 400);
+    } catch (err) {
+      message.textContent = err.message;
+    }
+  });
   document.addEventListener("click", function(event) {
     const button = event.target.closest("button[data-refresh]");
     if (!button) return;
