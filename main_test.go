@@ -1345,6 +1345,9 @@ func TestRefreshUsesHostHTTPAndAuthJSON(t *testing.T) {
 				return nil, err
 			}
 			if req.Method == http.MethodPost {
+				if got := req.Headers.Get("X-CPA-Usage-Keeper-Request"); got != "fetch" {
+					t.Fatalf("keeper request intent header = %q, want fetch", got)
+				}
 				resp, _ := json.Marshal(pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"accepted":1}`)})
 				return resp, nil
 			}
@@ -1401,6 +1404,9 @@ func TestResourceRefreshUsesKeeperEndpoint(t *testing.T) {
 				return nil, err
 			}
 			if req.Method == http.MethodPost {
+				if got := req.Headers.Get("X-CPA-Usage-Keeper-Request"); got != "fetch" {
+					t.Fatalf("keeper request intent header = %q, want fetch", got)
+				}
 				resp, _ := json.Marshal(pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"accepted":1}`)})
 				return resp, nil
 			}

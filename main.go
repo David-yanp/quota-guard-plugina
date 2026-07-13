@@ -3625,8 +3625,9 @@ func triggerQuotaRefresh(endpoint string, file pluginapi.HostAuthFileEntry) erro
 		Method: http.MethodPost,
 		URL:    urlValue,
 		Headers: http.Header{
-			"accept":       []string{contentTypeJSON},
-			"content-type": []string{contentTypeJSON},
+			"accept":                     []string{contentTypeJSON},
+			"content-type":               []string{contentTypeJSON},
+			"X-Cpa-Usage-Keeper-Request": []string{"fetch"},
 		},
 		Body: body,
 	})
