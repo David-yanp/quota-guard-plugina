@@ -3643,9 +3643,6 @@ func fetchKeeperUsageSnapshot(endpoint string, now time.Time) (keeperUsageSnapsh
 	if payload.WindowEnd.IsZero() || now.Sub(payload.WindowEnd) > 5*time.Minute || payload.WindowEnd.After(now.Add(5*time.Minute)) {
 		return keeperUsageSnapshot{}, fmt.Errorf("keeper usage snapshot is stale")
 	}
-	if len(payload.CurrentUsage.AuthFiles) == 0 {
-		return keeperUsageSnapshot{}, fmt.Errorf("keeper usage has no auth_files")
-	}
 	snapshot := keeperUsageSnapshot{WindowStart: payload.WindowStart, WindowEnd: payload.WindowEnd, FetchedAt: now, AuthFiles: map[string]keeperUsageItem{}}
 	for _, item := range payload.CurrentUsage.AuthFiles {
 		key := strings.TrimSpace(item.Key)
@@ -3653,9 +3650,6 @@ func fetchKeeperUsageSnapshot(endpoint string, now time.Time) (keeperUsageSnapsh
 			continue
 		}
 		snapshot.AuthFiles[key] = keeperUsageItem{AuthIndex: key, Label: item.Label, Tokens: math.Max(0, item.Tokens), Requests: item.Requests, Share: item.Share}
-	}
-	if len(snapshot.AuthFiles) == 0 {
-		return keeperUsageSnapshot{}, fmt.Errorf("keeper usage has no usable auth_files")
 	}
 	return snapshot, nil
 }
@@ -3679,6 +3673,13 @@ func (g *quotaGuard) analyzeRebalanceLocked(snapshot keeperUsageSnapshot, forceA
 		return g.recordRebalanceFailureLocked(now, errLoads.Error())
 	}
 	g.state.Rebalance.Groups = loads
+	totalTokens := 0.0
+	for _, load := range loads {
+		totalTokens += load.Tokens
+	}
+	if totalTokens <= 0 {
+		return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "skipped", Reason: "no usage in analysis window"})
+	}
 	if now.Sub(g.state.Rebalance.StartedAt) < time.Duration(g.cfg.ClientAffinityRebalanceWarmupSecs)*time.Second {
 		return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "observed", Reason: "warmup period is still active"})
 	}

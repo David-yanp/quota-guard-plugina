@@ -1748,7 +1748,6 @@ func TestFetchKeeperUsageSnapshotFailsClosed(t *testing.T) {
 		resp pluginapi.HTTPResponse
 	}{
 		{name: "forbidden", resp: pluginapi.HTTPResponse{StatusCode: 403, Body: []byte(`{"error":"forbidden"}`)}},
-		{name: "empty", resp: pluginapi.HTTPResponse{StatusCode: 200, Body: mustJSON(t, map[string]any{"window_end": g.now(), "current_usage": map[string]any{"auth_files": []any{}}})}},
 		{name: "stale", resp: pluginapi.HTTPResponse{StatusCode: 200, Body: mustJSON(t, map[string]any{"window_end": g.now().Add(-10 * time.Minute), "current_usage": map[string]any{"auth_files": []map[string]any{{"key": "idx-a", "tokens": 1}}}})}},
 	}
 	for _, tt := range tests {
@@ -1760,6 +1759,27 @@ func TestFetchKeeperUsageSnapshotFailsClosed(t *testing.T) {
 				t.Fatal("fetch succeeded, want fail closed")
 			}
 		})
+	}
+}
+
+func TestFetchKeeperUsageSnapshotAcceptsEmptyWindow(t *testing.T) {
+	g := testGuard(t)
+	previous := callHostFunc
+	t.Cleanup(func() { callHostFunc = previous })
+	callHostFunc = func(string, any) (json.RawMessage, error) {
+		resp := pluginapi.HTTPResponse{StatusCode: 200, Body: mustJSON(t, map[string]any{
+			"window_start":  g.now().Add(-time.Hour),
+			"window_end":    g.now(),
+			"current_usage": map[string]any{"auth_files": []any{}},
+		})}
+		return mustJSON(t, resp), nil
+	}
+	snapshot, err := fetchKeeperUsageSnapshot("http://keeper/usage", g.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.AuthFiles) != 0 {
+		t.Fatalf("auth files = %#v", snapshot.AuthFiles)
 	}
 }
 
@@ -1819,6 +1839,18 @@ func TestRebalanceMovesOneIdleRecentlyUsedBinding(t *testing.T) {
 	}
 	if got := g.state.ClientBindings["client-active"].GroupID; got != "group-a" {
 		t.Fatalf("active client moved to %q", got)
+	}
+}
+
+func TestRebalanceEmptyUsageWindowIsSkippedWithoutError(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	snapshot := keeperUsageSnapshot{WindowStart: g.now().Add(-time.Hour), WindowEnd: g.now(), FetchedAt: g.now(), AuthFiles: map[string]keeperUsageItem{}}
+	entry := g.analyzeRebalanceLocked(snapshot, false)
+	if entry.Result != "skipped" || entry.Reason != "no usage in analysis window" {
+		t.Fatalf("entry = %#v", entry)
+	}
+	if g.state.Rebalance.LastError != "" {
+		t.Fatalf("last error = %q", g.state.Rebalance.LastError)
 	}
 }
 

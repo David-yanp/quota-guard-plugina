@@ -81,6 +81,7 @@ Quota Guard is a CLIProxyAPI plugin that adds quota-aware fill-first scheduling 
 - Automatic rebalance candidates must have activity inside the configured 60-minute window, be idle for at least 10 minutes, and be outside automatic/manual move cooldowns. Bindings with no activity in the window stay unchanged.
 - Rebalance at most one binding per default 10-minute cycle. Automatic moves cool down for 60 minutes; manual moves cool down for 24 hours.
 - Shared backup usage must be allocated by recorded group picks. If attribution is unavailable, fail closed and record the reason instead of moving a binding.
+- Keeper `auth_files: []` is a valid zero-traffic snapshot, not an endpoint failure. Record a skipped analysis with `no usage in analysis window`, clear prior Keeper errors, and do not move bindings.
 - `observe` mode is required for grey rollout. It may analyze and record recommendations but must not mutate bindings.
 - Persist rebalance history with the source/target groups, client, load metrics, idle duration, predicted improvement, result, and reason.
 - If current primary becomes skipped after refresh or status changes, show stale/last-selected state only. Do not mutate scheduler state from UI refresh; actual switching belongs to the next `scheduler.pick`.

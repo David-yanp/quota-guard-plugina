@@ -40,6 +40,7 @@ Quota Guard can combine Keeper's rolling auth-file usage with plugin-side client
 - Automatic moves are limited to one per cycle, followed by a 60-minute cooldown. Manual moves receive a 24-hour cooldown.
 - `observe` mode records recommendations without changing bindings. `auto` mode applies moves that satisfy the load-ratio and predicted-improvement guards.
 - Keeper errors, stale responses, missing auth usage, or unattributable shared-backup usage fail closed and never interrupt normal scheduling.
+- An empty `auth_files` list is a valid no-traffic window: all group loads become zero, no binding moves, and the state records `no usage in analysis window` instead of an error.
 
 ## Resource UI
 
