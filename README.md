@@ -34,10 +34,16 @@ When `client_affinity_enabled` is true, requests with `X-CPA-Client-ID` are boun
 Quota Guard can combine Keeper's rolling auth-file usage with plugin-side client activity to rebalance persistent bindings without disrupting active sessions.
 
 - Keeper `current_usage.auth_files` is authoritative for group-level tokens and requests.
-- Client pick and usage activity is retained only for the configured rolling window and cooldown periods.
+- Client pick and usage activity is retained only for the configured rolling windows and cooldown periods.
 - Loads are normalized by the main account capacity; shared Pro backups are not counted as group capacity multiple times.
-- Only clients used during the last hour and idle for at least 10 minutes are eligible to move. Completely unused bindings stay unchanged.
-- Automatic moves are limited to one per cycle, followed by a 60-minute cooldown. Manual moves receive a 24-hour cooldown.
+- Predicted load combines Keeper's minimum supported 15-minute burst rate and a 60-minute baseline rate, weighted 70/30 by default.
+- Effective group capacity decreases as real quota approaches the configured reserve floor.
+- Active requests are never canceled. Recent activity and inflight count add a bounded migration penalty instead of permanently blocking a continuously active client; new requests use the new group while old inflight requests finish on the old group.
+- Bindings with no activity in the slow window stay unchanged, and moved clients remain protected by cooldowns.
+- Automatic moves are limited to one per cycle, followed by a 45-minute cooldown. Manual moves receive a 24-hour cooldown.
+- Overload must persist for three analysis samples. The default hysteresis requires source pressure at or above 1.25 and target pressure at or below 0.85.
+- The planner evaluates every safe client/target pair and chooses the single move with the largest reduction in maximum normalized group pressure.
+- New clients use capacity-weighted rendezvous assignment in `auto` mode; `observe` mode preserves the existing assignment behavior.
 - `observe` mode records recommendations without changing bindings. `auto` mode applies moves that satisfy the load-ratio and predicted-improvement guards.
 - Keeper errors, stale responses, missing auth usage, or unattributable shared-backup usage fail closed and never interrupt normal scheduling.
 - An empty `auth_files` list is a valid no-traffic window: all group loads become zero, no binding moves, and the state records `no usage in analysis window` instead of an error.
@@ -128,6 +134,8 @@ Start from `config.example.yaml` and merge the `plugins.configs.quota-guard` blo
 - `client_affinity_rebalance_enabled`: enables Keeper-backed load analysis.
 - `client_affinity_rebalance_mode`: `observe` records recommendations; `auto` applies eligible moves.
 - `client_affinity_rebalance_usage_endpoint`: Keeper realtime usage endpoint, normally using `window=60m`.
+- `client_affinity_rebalance_fast_window_minutes` and `client_affinity_rebalance_fast_weight`: burst window and its prediction weight.
+- `client_affinity_rebalance_overload_threshold`, `client_affinity_rebalance_target_threshold`, and `client_affinity_rebalance_overload_consecutive`: migration hysteresis.
 - `resource_actions_require_management_key`: controls whether resource-page actions require the management key.
 
 ## Management Routes

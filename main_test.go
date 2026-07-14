@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -1793,6 +1794,9 @@ func setupRebalanceGuard(t *testing.T) *quotaGuard {
 	g.cfg.ClientAffinityRebalanceIdleSecs = 600
 	g.cfg.ClientAffinityRebalanceCooldownSecs = 3600
 	g.cfg.ClientAffinityManualCooldownSecs = 86400
+	g.cfg.ClientAffinityRebalanceStreak = 1
+	g.cfg.ClientAffinityRebalanceOverload = 1.25
+	g.cfg.ClientAffinityRebalanceTarget = 0.85
 	g.state.Rebalance.StartedAt = g.now().Add(-2 * time.Hour)
 	g.state.ManualGroups["group-a"] = []string{"a", "backup-a"}
 	g.state.ManualGroups["group-b"] = []string{"b", "backup-b"}
@@ -1829,7 +1833,7 @@ func addRebalanceClient(g *quotaGuard, clientID, groupID string, lastSeen time.T
 func TestRebalanceMovesOneIdleRecentlyUsedBinding(t *testing.T) {
 	g := setupRebalanceGuard(t)
 	addRebalanceClient(g, "client-idle", "group-a", g.now().Add(-15*time.Minute), 30)
-	addRebalanceClient(g, "client-active", "group-a", g.now().Add(-time.Minute), 60)
+	addRebalanceClient(g, "client-active", "group-a", g.now().Add(-10*time.Second), 60)
 	entry := g.analyzeRebalanceLocked(rebalanceSnapshot(g, 90, 10), false)
 	if entry.Result != "moved" || entry.ClientID != "client-idle" {
 		t.Fatalf("entry = %#v", entry)
@@ -1871,6 +1875,7 @@ func TestRebalanceLeavesUnusedAndCoolingBindingsUnchanged(t *testing.T) {
 			addRebalanceClient(g, "client-idle", "group-a", g.now().Add(-15*time.Minute), 30)
 			addRebalanceClient(g, "client-active", "group-a", g.now().Add(-time.Minute), 60)
 			tt.mutate(g.state.ClientBindings["client-idle"], g)
+			tt.mutate(g.state.ClientBindings["client-active"], g)
 			entry := g.analyzeRebalanceLocked(rebalanceSnapshot(g, 90, 10), false)
 			if entry.Result == "moved" {
 				t.Fatalf("entry = %#v", entry)
@@ -1908,6 +1913,101 @@ func TestRebalanceOnceDoesNotBypassWarmup(t *testing.T) {
 	}
 	if got := g.state.ClientBindings["client-idle"].GroupID; got != "group-a" {
 		t.Fatalf("group = %q", got)
+	}
+}
+
+func TestRebalanceCombinesFastAndSlowWindows(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	g.rebuildAffinityGroupsLocked(g.affinitySnapshotCandidatesLocked(), g.now())
+	fast := rebalanceSnapshot(g, 50, 0)
+	fast.WindowStart = g.now().Add(-5 * time.Minute)
+	slow := rebalanceSnapshot(g, 10, 90)
+	loads, err := g.buildCompositeGroupLoadsLocked(fast, slow, g.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	load := loads["group-a"]
+	if load.FastTokens != 50 || load.SlowTokens != 10 || load.Tokens <= 400 {
+		t.Fatalf("load = %#v", load)
+	}
+}
+
+func TestNormalizeConfigUsesKeeperSupportedFastWindow(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.ClientAffinityRebalanceFastWindowMins = 5
+	cfg = normalizeConfig(cfg)
+	if cfg.ClientAffinityRebalanceFastWindowMins != 15 {
+		t.Fatalf("fast window = %d, want 15", cfg.ClientAffinityRebalanceFastWindowMins)
+	}
+}
+
+func TestRebalanceRequiresConsecutiveOverloadSamples(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	g.cfg.ClientAffinityRebalanceStreak = 3
+	addRebalanceClient(g, "client-idle", "group-a", g.now().Add(-15*time.Minute), 30)
+	addRebalanceClient(g, "client-active", "group-a", g.now().Add(-10*time.Second), 60)
+	for i := 1; i <= 2; i++ {
+		entry := g.analyzeRebalanceLocked(rebalanceSnapshot(g, 90, 10), false)
+		if entry.Result != "observed" || !strings.Contains(entry.Reason, "consecutive") {
+			t.Fatalf("sample %d entry = %#v", i, entry)
+		}
+	}
+	entry := g.analyzeRebalanceLocked(rebalanceSnapshot(g, 90, 10), false)
+	if entry.Result != "moved" {
+		t.Fatalf("third sample entry = %#v", entry)
+	}
+}
+
+func TestRebalanceTreatsActiveInflightAsMoveCost(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	g.cfg.ClientAffinityRebalanceIdleSecs = 30
+	addRebalanceClient(g, "client-idle", "group-a", g.now().Add(-time.Minute), 30)
+	addRebalanceClient(g, "client-active", "group-a", g.now().Add(-10*time.Second), 60)
+	g.ensureAccountByKeyLocked("a").Inflight = append(g.ensureAccountByKeyLocked("a").Inflight, inflightReserve{At: g.now(), ClientID: "client-idle", GroupID: "group-a", AuthID: "a"})
+	entry := g.analyzeRebalanceLocked(rebalanceSnapshot(g, 90, 10), false)
+	if entry.Result != "moved" {
+		t.Fatalf("entry = %#v", entry)
+	}
+}
+
+func TestEffectiveAffinityCapacityDropsNearReserve(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	account := g.ensureAccountByKeyLocked("a")
+	account.Limits[window7d] = 100
+	account.QuotaSnapshots[window7d] = quotaWindowSnapshot{At: g.now(), RemainingPercent: 20, LimitScore: 100}
+	low := g.effectiveAffinityCapacityLocked(account, g.now())
+	account.QuotaSnapshots[window7d] = quotaWindowSnapshot{At: g.now(), RemainingPercent: 100, LimitScore: 100}
+	high := g.effectiveAffinityCapacityLocked(account, g.now())
+	if !(low < high && low >= 10) {
+		t.Fatalf("low=%.2f high=%.2f", low, high)
+	}
+}
+
+func TestWeightedRendezvousAssignmentIsStableAndCapacityAware(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	g.cfg.ClientAffinityRebalanceMode = "auto"
+	g.state.ManualGroups = map[string][]string{"large": {"a", "backup-a"}, "small": {"b", "backup-b"}}
+	g.ensureAccountByKeyLocked("a").Limits[window7d] = 400
+	g.ensureAccountByKeyLocked("b").Limits[window7d] = 100
+	cs := candidates("a", "backup-a", "b", "backup-b")
+	g.rebuildAffinityGroupsLocked(cs, g.now())
+	large := 0
+	for i := 0; i < 500; i++ {
+		clientID := fmt.Sprintf("client-%d", i)
+		group, _, ok := g.assignAffinityGroupLocked(clientID, cs, g.now())
+		if !ok {
+			t.Fatal("assignment failed")
+		}
+		repeat, _, _ := g.assignAffinityGroupLocked(clientID, cs, g.now())
+		if repeat != group {
+			t.Fatalf("unstable assignment %q != %q", group, repeat)
+		}
+		if group == "large" {
+			large++
+		}
+	}
+	if large < 300 {
+		t.Fatalf("large assignments = %d, want capacity-weighted majority", large)
 	}
 }
 

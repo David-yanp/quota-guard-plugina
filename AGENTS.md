@@ -78,8 +78,14 @@ Quota Guard is a CLIProxyAPI plugin that adds quota-aware fill-first scheduling 
 - Stable group IDs are not client hash assignment. Current new-client assignment is `binding_count / group_weight` among eligible groups; existing bindings stay sticky unless the bound group is unavailable or an operator deletes/moves them.
 - Optional load rebalancing must use Keeper realtime auth-file usage as the group-level source of truth and plugin-side scheduler/usage activity only to estimate each client's share.
 - Normalize group load by the main account capacity. Do not count a shared Pro/repeatable backup as capacity in every group.
-- Automatic rebalance candidates must have activity inside the configured 60-minute window, be idle for at least 10 minutes, and be outside automatic/manual move cooldowns. Bindings with no activity in the window stay unchanged.
-- Rebalance at most one binding per default 10-minute cycle. Automatic moves cool down for 60 minutes; manual moves cool down for 24 hours.
+- Predict load from Keeper's minimum supported 15-minute rate and the slow 60-minute rate, weighted 70/30 by default. Normalize unsupported fast windows to 15 minutes.
+- Scale main-account capacity by quota remaining above the reserve floor so depleted groups receive less target traffic.
+- Automatic rebalance candidates must have activity inside the slow window and be outside automatic/manual move cooldowns. Bindings with no activity stay unchanged.
+- Treat recent activity and client inflight count as bounded move penalties, not hard blockers. Existing inflight requests finish on the old group; only subsequent picks use the new binding.
+- Require three consecutive overload samples by default, with source pressure >= 1.25 and target pressure <= 0.85.
+- Evaluate all safe client/target pairs and choose the one move that most reduces maximum normalized group pressure. Rebalance at most one binding per default 5-minute cycle.
+- Automatic moves cool down for 45 minutes; manual moves cool down for 24 hours.
+- In `auto` mode, assign new clients with capacity-weighted rendezvous hashing. In `observe`, preserve existing assignment semantics and never mutate bindings.
 - Shared backup usage must be allocated by recorded group picks. If attribution is unavailable, fail closed and record the reason instead of moving a binding.
 - Keeper `auth_files: []` is a valid zero-traffic snapshot, not an endpoint failure. Record a skipped analysis with `no usage in analysis window`, clear prior Keeper errors, and do not move bindings.
 - `observe` mode is required for grey rollout. It may analyze and record recommendations but must not mutate bindings.

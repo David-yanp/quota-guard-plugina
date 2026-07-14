@@ -59,6 +59,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"html"
 	"log"
 	"math"
@@ -80,7 +81,7 @@ import (
 
 const (
 	pluginName          = "quota-guard"
-	pluginVersion       = "0.2.0"
+	pluginVersion       = "0.3.0"
 	resourceStatusPath  = "/status"
 	contentTypeJSON     = "application/json; charset=utf-8"
 	contentTypeHTML     = "text/html; charset=utf-8"
@@ -110,114 +111,124 @@ type lifecycleRequest struct {
 }
 
 type pluginConfig struct {
-	Enabled                             bool                `yaml:"enabled" json:"enabled"`
-	Priority                            int                 `yaml:"priority" json:"priority"`
-	StateFile                           string              `yaml:"state_file" json:"state_file"`
-	MinRemainingPercent                 float64             `yaml:"min_remaining_percent" json:"min_remaining_percent"`
-	StickyCurrentAuthSeconds            int64               `yaml:"sticky_current_auth_seconds" json:"sticky_current_auth_seconds"`
-	FailWhenAllLow                      bool                `yaml:"fail_when_all_low" json:"fail_when_all_low"`
-	DelegateWhenUnconfigured            string              `yaml:"delegate_when_unconfigured" json:"delegate_when_unconfigured"`
-	Default5hLimitScore                 float64             `yaml:"default_5h_limit_score" json:"default_5h_limit_score"`
-	Default7dLimitScore                 float64             `yaml:"default_7d_limit_score" json:"default_7d_limit_score"`
-	DefaultMonthlyLimitScore            float64             `yaml:"default_monthly_limit_score" json:"default_monthly_limit_score"`
-	ProLimitMultiplier                  float64             `yaml:"pro_limit_multiplier" json:"pro_limit_multiplier"`
-	InflightReserveScore                float64             `yaml:"inflight_reserve_score" json:"inflight_reserve_score"`
-	MaxInflightAgeSeconds               int64               `yaml:"max_inflight_age_seconds" json:"max_inflight_age_seconds"`
-	CountFailedRequests                 bool                `yaml:"count_failed_requests" json:"count_failed_requests"`
-	InputWeight                         float64             `yaml:"input_weight" json:"input_weight"`
-	OutputWeight                        float64             `yaml:"output_weight" json:"output_weight"`
-	ReasoningWeight                     float64             `yaml:"reasoning_weight" json:"reasoning_weight"`
-	CachedWeight                        float64             `yaml:"cached_weight" json:"cached_weight"`
-	RequestScore                        float64             `yaml:"request_score" json:"request_score"`
-	QuotaQueryURL                       string              `yaml:"quota_query_url" json:"quota_query_url,omitempty"`
-	QuotaQueryMinIntervalSecs           int64               `yaml:"quota_query_min_interval_seconds" json:"quota_query_min_interval_seconds,omitempty"`
-	QuotaRefreshEnabled                 bool                `yaml:"quota_refresh_enabled" json:"quota_refresh_enabled"`
-	QuotaRefreshTriggerEndpoint         string              `yaml:"quota_refresh_trigger_endpoint" json:"quota_refresh_trigger_endpoint,omitempty"`
-	QuotaRefreshTriggerWaitSecs         int64               `yaml:"quota_refresh_trigger_wait_seconds" json:"quota_refresh_trigger_wait_seconds"`
-	QuotaRefreshEndpoint                string              `yaml:"quota_refresh_endpoint" json:"quota_refresh_endpoint,omitempty"`
-	QuotaRefreshIntervalSecs            int64               `yaml:"quota_refresh_interval_seconds" json:"quota_refresh_interval_seconds"`
-	QuotaRefreshMinIntervalSecs         int64               `yaml:"quota_refresh_min_interval_per_auth_seconds" json:"quota_refresh_min_interval_per_auth_seconds"`
-	QuotaRefreshTimeoutSecs             int64               `yaml:"quota_refresh_timeout_seconds" json:"quota_refresh_timeout_seconds"`
-	QuotaRefreshOnStartup               bool                `yaml:"quota_refresh_on_startup" json:"quota_refresh_on_startup"`
-	QuotaSnapshotMaxAgeSecs             int64               `yaml:"quota_snapshot_max_age_seconds" json:"quota_snapshot_max_age_seconds"`
-	ResourceActionsRequireManagementKey bool                `yaml:"resource_actions_require_management_key" json:"resource_actions_require_management_key"`
-	RequestErrorStatusOverrideEnabled   bool                `yaml:"request_error_status_override_enabled" json:"request_error_status_override_enabled"`
-	ClientAffinityEnabled               bool                `yaml:"client_affinity_enabled" json:"client_affinity_enabled"`
-	ClientAffinityHeader                string              `yaml:"client_affinity_header" json:"client_affinity_header"`
-	ClientAffinityGroupMinSize          int                 `yaml:"client_affinity_group_min_size" json:"client_affinity_group_min_size"`
-	ClientAffinityAssignmentMode        string              `yaml:"client_affinity_assignment_mode" json:"client_affinity_assignment_mode"`
-	ClientAffinityStorePlainID          bool                `yaml:"client_affinity_store_plain_id" json:"client_affinity_store_plain_id"`
-	ClientAffinityAutoWeightByQuota     bool                `yaml:"client_affinity_auto_weight_by_quota" json:"client_affinity_auto_weight_by_quota"`
-	ClientAffinityGroups                map[string][]string `yaml:"client_affinity_groups,omitempty" json:"client_affinity_groups,omitempty"`
-	ClientAffinityRepeatableAuths       []string            `yaml:"client_affinity_repeatable_auths,omitempty" json:"client_affinity_repeatable_auths,omitempty"`
-	ClientAffinityRebalanceEnabled      bool                `yaml:"client_affinity_rebalance_enabled" json:"client_affinity_rebalance_enabled"`
-	ClientAffinityRebalanceMode         string              `yaml:"client_affinity_rebalance_mode" json:"client_affinity_rebalance_mode"`
-	ClientAffinityRebalanceUsageURL     string              `yaml:"client_affinity_rebalance_usage_endpoint" json:"client_affinity_rebalance_usage_endpoint,omitempty"`
-	ClientAffinityRebalanceIntervalSecs int64               `yaml:"client_affinity_rebalance_interval_seconds" json:"client_affinity_rebalance_interval_seconds"`
-	ClientAffinityRebalanceWindowMins   int64               `yaml:"client_affinity_rebalance_window_minutes" json:"client_affinity_rebalance_window_minutes"`
-	ClientAffinityRebalanceIdleSecs     int64               `yaml:"client_affinity_rebalance_idle_seconds" json:"client_affinity_rebalance_idle_seconds"`
-	ClientAffinityRebalanceCooldownSecs int64               `yaml:"client_affinity_rebalance_cooldown_seconds" json:"client_affinity_rebalance_cooldown_seconds"`
-	ClientAffinityManualCooldownSecs    int64               `yaml:"client_affinity_manual_move_cooldown_seconds" json:"client_affinity_manual_move_cooldown_seconds"`
-	ClientAffinityRebalanceWarmupSecs   int64               `yaml:"client_affinity_rebalance_warmup_seconds" json:"client_affinity_rebalance_warmup_seconds"`
-	ClientAffinityRebalanceMaxMoves     int                 `yaml:"client_affinity_rebalance_max_moves_per_cycle" json:"client_affinity_rebalance_max_moves_per_cycle"`
-	ClientAffinityRebalanceMinLoadRatio float64             `yaml:"client_affinity_rebalance_min_load_ratio" json:"client_affinity_rebalance_min_load_ratio"`
-	ClientAffinityRebalanceMinImprove   float64             `yaml:"client_affinity_rebalance_min_improvement_percent" json:"client_affinity_rebalance_min_improvement_percent"`
-	ClientAffinityRebalanceHistoryLimit int                 `yaml:"client_affinity_rebalance_history_limit" json:"client_affinity_rebalance_history_limit"`
+	Enabled                               bool                `yaml:"enabled" json:"enabled"`
+	Priority                              int                 `yaml:"priority" json:"priority"`
+	StateFile                             string              `yaml:"state_file" json:"state_file"`
+	MinRemainingPercent                   float64             `yaml:"min_remaining_percent" json:"min_remaining_percent"`
+	StickyCurrentAuthSeconds              int64               `yaml:"sticky_current_auth_seconds" json:"sticky_current_auth_seconds"`
+	FailWhenAllLow                        bool                `yaml:"fail_when_all_low" json:"fail_when_all_low"`
+	DelegateWhenUnconfigured              string              `yaml:"delegate_when_unconfigured" json:"delegate_when_unconfigured"`
+	Default5hLimitScore                   float64             `yaml:"default_5h_limit_score" json:"default_5h_limit_score"`
+	Default7dLimitScore                   float64             `yaml:"default_7d_limit_score" json:"default_7d_limit_score"`
+	DefaultMonthlyLimitScore              float64             `yaml:"default_monthly_limit_score" json:"default_monthly_limit_score"`
+	ProLimitMultiplier                    float64             `yaml:"pro_limit_multiplier" json:"pro_limit_multiplier"`
+	InflightReserveScore                  float64             `yaml:"inflight_reserve_score" json:"inflight_reserve_score"`
+	MaxInflightAgeSeconds                 int64               `yaml:"max_inflight_age_seconds" json:"max_inflight_age_seconds"`
+	CountFailedRequests                   bool                `yaml:"count_failed_requests" json:"count_failed_requests"`
+	InputWeight                           float64             `yaml:"input_weight" json:"input_weight"`
+	OutputWeight                          float64             `yaml:"output_weight" json:"output_weight"`
+	ReasoningWeight                       float64             `yaml:"reasoning_weight" json:"reasoning_weight"`
+	CachedWeight                          float64             `yaml:"cached_weight" json:"cached_weight"`
+	RequestScore                          float64             `yaml:"request_score" json:"request_score"`
+	QuotaQueryURL                         string              `yaml:"quota_query_url" json:"quota_query_url,omitempty"`
+	QuotaQueryMinIntervalSecs             int64               `yaml:"quota_query_min_interval_seconds" json:"quota_query_min_interval_seconds,omitempty"`
+	QuotaRefreshEnabled                   bool                `yaml:"quota_refresh_enabled" json:"quota_refresh_enabled"`
+	QuotaRefreshTriggerEndpoint           string              `yaml:"quota_refresh_trigger_endpoint" json:"quota_refresh_trigger_endpoint,omitempty"`
+	QuotaRefreshTriggerWaitSecs           int64               `yaml:"quota_refresh_trigger_wait_seconds" json:"quota_refresh_trigger_wait_seconds"`
+	QuotaRefreshEndpoint                  string              `yaml:"quota_refresh_endpoint" json:"quota_refresh_endpoint,omitempty"`
+	QuotaRefreshIntervalSecs              int64               `yaml:"quota_refresh_interval_seconds" json:"quota_refresh_interval_seconds"`
+	QuotaRefreshMinIntervalSecs           int64               `yaml:"quota_refresh_min_interval_per_auth_seconds" json:"quota_refresh_min_interval_per_auth_seconds"`
+	QuotaRefreshTimeoutSecs               int64               `yaml:"quota_refresh_timeout_seconds" json:"quota_refresh_timeout_seconds"`
+	QuotaRefreshOnStartup                 bool                `yaml:"quota_refresh_on_startup" json:"quota_refresh_on_startup"`
+	QuotaSnapshotMaxAgeSecs               int64               `yaml:"quota_snapshot_max_age_seconds" json:"quota_snapshot_max_age_seconds"`
+	ResourceActionsRequireManagementKey   bool                `yaml:"resource_actions_require_management_key" json:"resource_actions_require_management_key"`
+	RequestErrorStatusOverrideEnabled     bool                `yaml:"request_error_status_override_enabled" json:"request_error_status_override_enabled"`
+	ClientAffinityEnabled                 bool                `yaml:"client_affinity_enabled" json:"client_affinity_enabled"`
+	ClientAffinityHeader                  string              `yaml:"client_affinity_header" json:"client_affinity_header"`
+	ClientAffinityGroupMinSize            int                 `yaml:"client_affinity_group_min_size" json:"client_affinity_group_min_size"`
+	ClientAffinityAssignmentMode          string              `yaml:"client_affinity_assignment_mode" json:"client_affinity_assignment_mode"`
+	ClientAffinityStorePlainID            bool                `yaml:"client_affinity_store_plain_id" json:"client_affinity_store_plain_id"`
+	ClientAffinityAutoWeightByQuota       bool                `yaml:"client_affinity_auto_weight_by_quota" json:"client_affinity_auto_weight_by_quota"`
+	ClientAffinityGroups                  map[string][]string `yaml:"client_affinity_groups,omitempty" json:"client_affinity_groups,omitempty"`
+	ClientAffinityRepeatableAuths         []string            `yaml:"client_affinity_repeatable_auths,omitempty" json:"client_affinity_repeatable_auths,omitempty"`
+	ClientAffinityRebalanceEnabled        bool                `yaml:"client_affinity_rebalance_enabled" json:"client_affinity_rebalance_enabled"`
+	ClientAffinityRebalanceMode           string              `yaml:"client_affinity_rebalance_mode" json:"client_affinity_rebalance_mode"`
+	ClientAffinityRebalanceUsageURL       string              `yaml:"client_affinity_rebalance_usage_endpoint" json:"client_affinity_rebalance_usage_endpoint,omitempty"`
+	ClientAffinityRebalanceIntervalSecs   int64               `yaml:"client_affinity_rebalance_interval_seconds" json:"client_affinity_rebalance_interval_seconds"`
+	ClientAffinityRebalanceWindowMins     int64               `yaml:"client_affinity_rebalance_window_minutes" json:"client_affinity_rebalance_window_minutes"`
+	ClientAffinityRebalanceIdleSecs       int64               `yaml:"client_affinity_rebalance_idle_seconds" json:"client_affinity_rebalance_idle_seconds"`
+	ClientAffinityRebalanceCooldownSecs   int64               `yaml:"client_affinity_rebalance_cooldown_seconds" json:"client_affinity_rebalance_cooldown_seconds"`
+	ClientAffinityManualCooldownSecs      int64               `yaml:"client_affinity_manual_move_cooldown_seconds" json:"client_affinity_manual_move_cooldown_seconds"`
+	ClientAffinityRebalanceWarmupSecs     int64               `yaml:"client_affinity_rebalance_warmup_seconds" json:"client_affinity_rebalance_warmup_seconds"`
+	ClientAffinityRebalanceMaxMoves       int                 `yaml:"client_affinity_rebalance_max_moves_per_cycle" json:"client_affinity_rebalance_max_moves_per_cycle"`
+	ClientAffinityRebalanceMinLoadRatio   float64             `yaml:"client_affinity_rebalance_min_load_ratio" json:"client_affinity_rebalance_min_load_ratio"`
+	ClientAffinityRebalanceMinImprove     float64             `yaml:"client_affinity_rebalance_min_improvement_percent" json:"client_affinity_rebalance_min_improvement_percent"`
+	ClientAffinityRebalanceHistoryLimit   int                 `yaml:"client_affinity_rebalance_history_limit" json:"client_affinity_rebalance_history_limit"`
+	ClientAffinityRebalanceFastWindowMins int64               `yaml:"client_affinity_rebalance_fast_window_minutes" json:"client_affinity_rebalance_fast_window_minutes"`
+	ClientAffinityRebalanceFastWeight     float64             `yaml:"client_affinity_rebalance_fast_weight" json:"client_affinity_rebalance_fast_weight"`
+	ClientAffinityRebalanceOverload       float64             `yaml:"client_affinity_rebalance_overload_threshold" json:"client_affinity_rebalance_overload_threshold"`
+	ClientAffinityRebalanceTarget         float64             `yaml:"client_affinity_rebalance_target_threshold" json:"client_affinity_rebalance_target_threshold"`
+	ClientAffinityRebalanceStreak         int                 `yaml:"client_affinity_rebalance_overload_consecutive" json:"client_affinity_rebalance_overload_consecutive"`
 }
 
 func defaultConfig() pluginConfig {
 	return pluginConfig{
-		Enabled:                             true,
-		Priority:                            100,
-		StateFile:                           "plugins/quota-guard-state.json",
-		MinRemainingPercent:                 10,
-		StickyCurrentAuthSeconds:            120,
-		FailWhenAllLow:                      true,
-		DelegateWhenUnconfigured:            pluginapi.SchedulerBuiltinFillFirst,
-		Default5hLimitScore:                 1000000,
-		Default7dLimitScore:                 10000000,
-		DefaultMonthlyLimitScore:            40000000,
-		ProLimitMultiplier:                  20,
-		InflightReserveScore:                30000,
-		MaxInflightAgeSeconds:               1800,
-		CountFailedRequests:                 false,
-		InputWeight:                         1,
-		OutputWeight:                        1,
-		ReasoningWeight:                     1,
-		CachedWeight:                        0.1,
-		RequestScore:                        1,
-		QuotaQueryMinIntervalSecs:           300,
-		QuotaRefreshEnabled:                 true,
-		QuotaRefreshTriggerEndpoint:         "http://cpa-usage-keeper:8080/cpa/api/v1/quota/refresh",
-		QuotaRefreshTriggerWaitSecs:         2,
-		QuotaRefreshEndpoint:                "http://cpa-usage-keeper:8080/cpa/api/v1/quota/refresh/{auth_index}",
-		QuotaRefreshIntervalSecs:            60,
-		QuotaRefreshMinIntervalSecs:         30,
-		QuotaRefreshTimeoutSecs:             10,
-		QuotaRefreshOnStartup:               true,
-		QuotaSnapshotMaxAgeSecs:             900,
-		ResourceActionsRequireManagementKey: false,
-		RequestErrorStatusOverrideEnabled:   true,
-		ClientAffinityEnabled:               false,
-		ClientAffinityHeader:                "X-CPA-Client-ID",
-		ClientAffinityGroupMinSize:          2,
-		ClientAffinityAssignmentMode:        "auto-with-overrides",
-		ClientAffinityStorePlainID:          true,
-		ClientAffinityAutoWeightByQuota:     true,
-		ClientAffinityRepeatableAuths:       nil,
-		ClientAffinityRebalanceEnabled:      false,
-		ClientAffinityRebalanceMode:         "observe",
-		ClientAffinityRebalanceUsageURL:     "http://cpa-usage-keeper:8080/cpa/api/v1/usage/overview/realtime?window=60m",
-		ClientAffinityRebalanceIntervalSecs: 600,
-		ClientAffinityRebalanceWindowMins:   60,
-		ClientAffinityRebalanceIdleSecs:     600,
-		ClientAffinityRebalanceCooldownSecs: 3600,
-		ClientAffinityManualCooldownSecs:    86400,
-		ClientAffinityRebalanceWarmupSecs:   3600,
-		ClientAffinityRebalanceMaxMoves:     1,
-		ClientAffinityRebalanceMinLoadRatio: 1.5,
-		ClientAffinityRebalanceMinImprove:   10,
-		ClientAffinityRebalanceHistoryLimit: 200,
+		Enabled:                               true,
+		Priority:                              100,
+		StateFile:                             "plugins/quota-guard-state.json",
+		MinRemainingPercent:                   10,
+		StickyCurrentAuthSeconds:              120,
+		FailWhenAllLow:                        true,
+		DelegateWhenUnconfigured:              pluginapi.SchedulerBuiltinFillFirst,
+		Default5hLimitScore:                   1000000,
+		Default7dLimitScore:                   10000000,
+		DefaultMonthlyLimitScore:              40000000,
+		ProLimitMultiplier:                    20,
+		InflightReserveScore:                  30000,
+		MaxInflightAgeSeconds:                 1800,
+		CountFailedRequests:                   false,
+		InputWeight:                           1,
+		OutputWeight:                          1,
+		ReasoningWeight:                       1,
+		CachedWeight:                          0.1,
+		RequestScore:                          1,
+		QuotaQueryMinIntervalSecs:             300,
+		QuotaRefreshEnabled:                   true,
+		QuotaRefreshTriggerEndpoint:           "http://cpa-usage-keeper:8080/cpa/api/v1/quota/refresh",
+		QuotaRefreshTriggerWaitSecs:           2,
+		QuotaRefreshEndpoint:                  "http://cpa-usage-keeper:8080/cpa/api/v1/quota/refresh/{auth_index}",
+		QuotaRefreshIntervalSecs:              60,
+		QuotaRefreshMinIntervalSecs:           30,
+		QuotaRefreshTimeoutSecs:               10,
+		QuotaRefreshOnStartup:                 true,
+		QuotaSnapshotMaxAgeSecs:               900,
+		ResourceActionsRequireManagementKey:   false,
+		RequestErrorStatusOverrideEnabled:     true,
+		ClientAffinityEnabled:                 false,
+		ClientAffinityHeader:                  "X-CPA-Client-ID",
+		ClientAffinityGroupMinSize:            2,
+		ClientAffinityAssignmentMode:          "auto-with-overrides",
+		ClientAffinityStorePlainID:            true,
+		ClientAffinityAutoWeightByQuota:       true,
+		ClientAffinityRepeatableAuths:         nil,
+		ClientAffinityRebalanceEnabled:        false,
+		ClientAffinityRebalanceMode:           "observe",
+		ClientAffinityRebalanceUsageURL:       "http://cpa-usage-keeper:8080/cpa/api/v1/usage/overview/realtime?window=60m",
+		ClientAffinityRebalanceIntervalSecs:   300,
+		ClientAffinityRebalanceWindowMins:     60,
+		ClientAffinityRebalanceIdleSecs:       30,
+		ClientAffinityRebalanceCooldownSecs:   2700,
+		ClientAffinityManualCooldownSecs:      86400,
+		ClientAffinityRebalanceWarmupSecs:     3600,
+		ClientAffinityRebalanceMaxMoves:       1,
+		ClientAffinityRebalanceMinLoadRatio:   1.5,
+		ClientAffinityRebalanceMinImprove:     15,
+		ClientAffinityRebalanceHistoryLimit:   200,
+		ClientAffinityRebalanceFastWindowMins: 15,
+		ClientAffinityRebalanceFastWeight:     0.7,
+		ClientAffinityRebalanceOverload:       1.25,
+		ClientAffinityRebalanceTarget:         0.85,
+		ClientAffinityRebalanceStreak:         3,
 	}
 }
 
@@ -381,24 +392,29 @@ type keeperUsageItem struct {
 }
 
 type rebalanceState struct {
-	StartedAt      time.Time                 `json:"started_at,omitempty"`
-	LastAnalysisAt time.Time                 `json:"last_analysis_at,omitempty"`
-	LastError      string                    `json:"last_error,omitempty"`
-	KeeperUsage    keeperUsageSnapshot       `json:"keeper_usage,omitempty"`
-	Groups         map[string]groupLoadState `json:"groups,omitempty"`
-	History        []rebalanceHistoryEntry   `json:"history,omitempty"`
+	StartedAt       time.Time                 `json:"started_at,omitempty"`
+	LastAnalysisAt  time.Time                 `json:"last_analysis_at,omitempty"`
+	LastError       string                    `json:"last_error,omitempty"`
+	KeeperUsage     keeperUsageSnapshot       `json:"keeper_usage,omitempty"`
+	KeeperFastUsage keeperUsageSnapshot       `json:"keeper_fast_usage,omitempty"`
+	Groups          map[string]groupLoadState `json:"groups,omitempty"`
+	OverloadStreak  map[string]int            `json:"overload_streak,omitempty"`
+	History         []rebalanceHistoryEntry   `json:"history,omitempty"`
 }
 
 type groupLoadState struct {
-	GroupID     string  `json:"group_id"`
-	Tokens      float64 `json:"tokens"`
-	Requests    float64 `json:"requests"`
-	Capacity    float64 `json:"capacity"`
-	ActualShare float64 `json:"actual_share"`
-	TargetShare float64 `json:"target_share"`
-	LoadFactor  float64 `json:"load_factor"`
-	Eligible    bool    `json:"eligible"`
-	Reason      string  `json:"reason,omitempty"`
+	GroupID           string  `json:"group_id"`
+	Tokens            float64 `json:"tokens"`
+	Requests          float64 `json:"requests"`
+	Capacity          float64 `json:"capacity"`
+	ActualShare       float64 `json:"actual_share"`
+	TargetShare       float64 `json:"target_share"`
+	LoadFactor        float64 `json:"load_factor"`
+	Eligible          bool    `json:"eligible"`
+	Reason            string  `json:"reason,omitempty"`
+	FastTokens        float64 `json:"fast_tokens,omitempty"`
+	SlowTokens        float64 `json:"slow_tokens,omitempty"`
+	EffectiveCapacity float64 `json:"effective_capacity,omitempty"`
 }
 
 type rebalanceHistoryEntry struct {
@@ -506,6 +522,7 @@ type affinitySnapshot struct {
 	Groups            []affinityGroupSnapshot `json:"groups,omitempty"`
 	Bindings          []clientBindingSnapshot `json:"bindings,omitempty"`
 	Rebalance         rebalanceState          `json:"rebalance,omitempty"`
+	FastWindowMinutes int64                   `json:"fast_window_minutes,omitempty"`
 }
 
 type affinityGroupSnapshot struct {
@@ -526,6 +543,9 @@ type affinityGroupSnapshot struct {
 	TargetShare      float64   `json:"target_share,omitempty"`
 	LoadFactor       float64   `json:"load_factor,omitempty"`
 	MainCapacity     float64   `json:"main_capacity,omitempty"`
+	FastTokens       float64   `json:"fast_tokens,omitempty"`
+	SlowTokens       float64   `json:"slow_tokens,omitempty"`
+	OverloadStreak   int       `json:"overload_streak,omitempty"`
 }
 
 type clientBindingSnapshot struct {
@@ -720,6 +740,10 @@ func pluginRegistration() registration {
 				{Name: "client_affinity_rebalance_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Analyze Keeper usage and rebalance idle client bindings across affinity groups."},
 				{Name: "client_affinity_rebalance_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"observe", "auto"}, Description: "Observe only or automatically apply eligible rebalance moves."},
 				{Name: "client_affinity_rebalance_usage_endpoint", Type: pluginapi.ConfigFieldTypeString, Description: "Keeper realtime usage endpoint used for 60 minute auth load snapshots."},
+				{Name: "client_affinity_rebalance_fast_window_minutes", Type: pluginapi.ConfigFieldTypeNumber, Description: "Fast Keeper usage window used to detect bursts."},
+				{Name: "client_affinity_rebalance_fast_weight", Type: pluginapi.ConfigFieldTypeNumber, Description: "Weight of the fast-window rate in predicted load."},
+				{Name: "client_affinity_rebalance_overload_threshold", Type: pluginapi.ConfigFieldTypeNumber, Description: "Normalized pressure required to count an overload sample."},
+				{Name: "client_affinity_rebalance_target_threshold", Type: pluginapi.ConfigFieldTypeNumber, Description: "Maximum normalized pressure for a migration target."},
 			},
 		},
 		Capabilities: registrationCapabilities{
@@ -776,6 +800,9 @@ func (g *quotaGuard) configure(raw []byte) error {
 	}
 	if g.state.Rebalance.Groups == nil {
 		g.state.Rebalance.Groups = map[string]groupLoadState{}
+	}
+	if g.state.Rebalance.OverloadStreak == nil {
+		g.state.Rebalance.OverloadStreak = map[string]int{}
 	}
 	g.saveErr = nil
 	g.restartBackgroundRefreshLocked()
@@ -1059,6 +1086,21 @@ func normalizeConfig(cfg pluginConfig) pluginConfig {
 	if cfg.ClientAffinityRebalanceHistoryLimit <= 0 {
 		cfg.ClientAffinityRebalanceHistoryLimit = defaults.ClientAffinityRebalanceHistoryLimit
 	}
+	if cfg.ClientAffinityRebalanceFastWindowMins != 15 && cfg.ClientAffinityRebalanceFastWindowMins != 30 {
+		cfg.ClientAffinityRebalanceFastWindowMins = defaults.ClientAffinityRebalanceFastWindowMins
+	}
+	if cfg.ClientAffinityRebalanceFastWeight <= 0 || cfg.ClientAffinityRebalanceFastWeight >= 1 {
+		cfg.ClientAffinityRebalanceFastWeight = defaults.ClientAffinityRebalanceFastWeight
+	}
+	if cfg.ClientAffinityRebalanceOverload <= 1 {
+		cfg.ClientAffinityRebalanceOverload = defaults.ClientAffinityRebalanceOverload
+	}
+	if cfg.ClientAffinityRebalanceTarget <= 0 || cfg.ClientAffinityRebalanceTarget >= 1 {
+		cfg.ClientAffinityRebalanceTarget = defaults.ClientAffinityRebalanceTarget
+	}
+	if cfg.ClientAffinityRebalanceStreak <= 0 {
+		cfg.ClientAffinityRebalanceStreak = defaults.ClientAffinityRebalanceStreak
+	}
 	return cfg
 }
 
@@ -1152,7 +1194,7 @@ func (g *quotaGuard) pickAffinityLocked(candidates []pluginapi.SchedulerAuthCand
 	groupID, ok := g.boundAffinityGroupLocked(clientID, candidates, now)
 	if !ok {
 		var reason string
-		groupID, reason, ok = g.assignAffinityGroupLocked(candidates, now)
+		groupID, reason, ok = g.assignAffinityGroupLocked(clientID, candidates, now)
 		if !ok {
 			if g.cfg.FailWhenAllLow {
 				return pluginapi.SchedulerPickResponse{}, fmt.Errorf("no eligible affinity group for client %q: %s", clientID, reason)
@@ -1168,7 +1210,7 @@ func (g *quotaGuard) pickAffinityLocked(candidates []pluginapi.SchedulerAuthCand
 	if selected, ok := g.firstEligibleGroupCandidateLocked(members, now); ok {
 		return g.selectGroupCandidateLocked(groupID, clientID, selected, now), nil
 	}
-	groupID, reason, ok := g.assignAffinityGroupLocked(candidates, now)
+	groupID, reason, ok := g.assignAffinityGroupLocked(clientID, candidates, now)
 	if ok {
 		g.upsertClientBindingLocked(clientID, groupID, "client_header", now)
 		members = g.affinityGroupCandidatesLocked(groupID, candidates)
@@ -1683,7 +1725,7 @@ func (g *quotaGuard) boundAffinityGroupLocked(clientID string, candidates []plug
 	return "", false
 }
 
-func (g *quotaGuard) assignAffinityGroupLocked(candidates []pluginapi.SchedulerAuthCandidate, now time.Time) (string, string, bool) {
+func (g *quotaGuard) assignAffinityGroupLocked(clientID string, candidates []pluginapi.SchedulerAuthCandidate, now time.Time) (string, string, bool) {
 	bestGroup := ""
 	bestScore := 0.0
 	bestSet := false
@@ -1698,6 +1740,16 @@ func (g *quotaGuard) assignAffinityGroupLocked(candidates []pluginapi.SchedulerA
 			continue
 		}
 		weight := group.Weight
+		if g.cfg.ClientAffinityRebalanceEnabled && g.cfg.ClientAffinityRebalanceMode == "auto" && group.MainAuthID != "" {
+			weight = g.effectiveAffinityCapacityLocked(g.ensureAccountByKeyLocked(group.MainAuthID), now)
+			score := weightedRendezvousScore(clientID, groupID, weight)
+			if !bestSet || score < bestScore || (score == bestScore && groupID < bestGroup) {
+				bestSet = true
+				bestScore = score
+				bestGroup = groupID
+			}
+			continue
+		}
 		if weight <= 0 {
 			weight = 1
 		}
@@ -1712,6 +1764,18 @@ func (g *quotaGuard) assignAffinityGroupLocked(candidates []pluginapi.SchedulerA
 		return "", reason, false
 	}
 	return bestGroup, "", true
+}
+
+func weightedRendezvousScore(clientID, groupID string, weight float64) float64 {
+	if weight <= 0 {
+		weight = 1
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(clientID))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(groupID))
+	u := (float64(h.Sum64()) + 1) / (float64(^uint64(0)) + 2)
+	return -math.Log(u) / weight
 }
 
 func (g *quotaGuard) upsertClientBindingLocked(clientID, groupID, source string, now time.Time) {
@@ -2288,6 +2352,9 @@ func (g *quotaGuard) loadStateLocked() error {
 	if loaded.Rebalance.Groups == nil {
 		loaded.Rebalance.Groups = map[string]groupLoadState{}
 	}
+	if loaded.Rebalance.OverloadStreak == nil {
+		loaded.Rebalance.OverloadStreak = map[string]int{}
+	}
 	if loaded.Rebalance.StartedAt.IsZero() {
 		loaded.Rebalance.StartedAt = g.now()
 	}
@@ -2497,6 +2564,7 @@ func (g *quotaGuard) affinitySnapshotLocked(now time.Time) affinitySnapshot {
 		LegacyWhenMissing: true,
 		GroupMinSize:      g.cfg.ClientAffinityGroupMinSize,
 		Rebalance:         g.state.Rebalance,
+		FastWindowMinutes: g.cfg.ClientAffinityRebalanceFastWindowMins,
 	}
 	groupIDs := make([]string, 0, len(g.state.Groups))
 	for groupID := range g.state.Groups {
@@ -2537,6 +2605,9 @@ func (g *quotaGuard) affinitySnapshotLocked(now time.Time) affinitySnapshot {
 			TargetShare:      round2(load.TargetShare),
 			LoadFactor:       round2(load.LoadFactor),
 			MainCapacity:     round2(load.Capacity),
+			FastTokens:       round2(load.FastTokens),
+			SlowTokens:       round2(load.SlowTokens),
+			OverloadStreak:   g.state.Rebalance.OverloadStreak[groupID],
 		})
 	}
 	bindings := make([]*clientBindingState, 0, len(g.state.ClientBindings))
@@ -3576,17 +3647,35 @@ func (g *quotaGuard) runRebalanceNow(forceApply bool) (rebalanceHistoryEntry, er
 			g.refreshQuotaSnapshots(auths.Files, req)
 		}
 	}
-	snapshot, errFetch := fetchKeeperUsageSnapshot(cfg.ClientAffinityRebalanceUsageURL, now)
+	fastURL := keeperUsageURLForWindow(cfg.ClientAffinityRebalanceUsageURL, cfg.ClientAffinityRebalanceFastWindowMins)
+	slowURL := keeperUsageURLForWindow(cfg.ClientAffinityRebalanceUsageURL, cfg.ClientAffinityRebalanceWindowMins)
+	fastSnapshot, errFast := fetchKeeperUsageSnapshot(fastURL, now)
+	slowSnapshot, errSlow := fetchKeeperUsageSnapshot(slowURL, now)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if errFetch != nil {
+	if errFast != nil || errSlow != nil {
+		errFetch := errFast
+		if errFetch == nil {
+			errFetch = errSlow
+		}
 		entry := g.recordRebalanceFailureLocked(now, "keeper usage unavailable: "+errFetch.Error())
 		g.saveErr = g.saveStateLocked()
 		return entry, errFetch
 	}
-	entry := g.analyzeRebalanceLocked(snapshot, forceApply)
+	entry := g.analyzeRebalanceWindowsLocked(fastSnapshot, slowSnapshot, forceApply)
 	g.saveErr = g.saveStateLocked()
 	return entry, g.saveErr
+}
+
+func keeperUsageURLForWindow(endpoint string, minutes int64) string {
+	parsed, errParse := url.Parse(strings.TrimSpace(endpoint))
+	if errParse != nil || parsed == nil {
+		return endpoint
+	}
+	query := parsed.Query()
+	query.Set("window", fmt.Sprintf("%dm", minutes))
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 func (g *quotaGuard) rebalanceQuotaRefreshRequests(files []pluginapi.HostAuthFileEntry, now time.Time) []refreshRequest {
@@ -3661,14 +3750,22 @@ type bindingLoadEstimate struct {
 }
 
 func (g *quotaGuard) analyzeRebalanceLocked(snapshot keeperUsageSnapshot, forceApply bool) rebalanceHistoryEntry {
+	return g.analyzeRebalanceWindowsLocked(snapshot, snapshot, forceApply)
+}
+
+func (g *quotaGuard) analyzeRebalanceWindowsLocked(fastSnapshot, slowSnapshot keeperUsageSnapshot, forceApply bool) rebalanceHistoryEntry {
 	now := g.now()
 	g.ensureAffinityStateLocked()
+	if g.state.Rebalance.OverloadStreak == nil {
+		g.state.Rebalance.OverloadStreak = map[string]int{}
+	}
 	g.pruneClientActivityLocked(now)
 	g.rebuildAffinityGroupsLocked(g.affinitySnapshotCandidatesLocked(), now)
 	g.state.Rebalance.LastAnalysisAt = now
-	g.state.Rebalance.KeeperUsage = snapshot
+	g.state.Rebalance.KeeperFastUsage = fastSnapshot
+	g.state.Rebalance.KeeperUsage = slowSnapshot
 	g.state.Rebalance.LastError = ""
-	loads, errLoads := g.buildGroupLoadsLocked(snapshot, now)
+	loads, errLoads := g.buildCompositeGroupLoadsLocked(fastSnapshot, slowSnapshot, now)
 	if errLoads != nil {
 		return g.recordRebalanceFailureLocked(now, errLoads.Error())
 	}
@@ -3683,21 +3780,29 @@ func (g *quotaGuard) analyzeRebalanceLocked(snapshot keeperUsageSnapshot, forceA
 	if now.Sub(g.state.Rebalance.StartedAt) < time.Duration(g.cfg.ClientAffinityRebalanceWarmupSecs)*time.Second {
 		return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "observed", Reason: "warmup period is still active"})
 	}
-	source, target, ok := selectRebalanceGroups(loads)
+	streakReady := false
+	for groupID, load := range loads {
+		if load.Eligible && load.LoadFactor >= g.cfg.ClientAffinityRebalanceOverload {
+			g.state.Rebalance.OverloadStreak[groupID]++
+		} else {
+			g.state.Rebalance.OverloadStreak[groupID] = 0
+		}
+		if g.state.Rebalance.OverloadStreak[groupID] >= g.cfg.ClientAffinityRebalanceStreak {
+			streakReady = true
+		}
+	}
+	if !streakReady {
+		return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "observed", Reason: fmt.Sprintf("waiting for %d consecutive overload samples", g.cfg.ClientAffinityRebalanceStreak)})
+	}
+	candidate, target, improvement, ok := g.bestGlobalRebalanceMoveLocked(loads, fastSnapshot.WindowStart, slowSnapshot.WindowStart, now)
 	if !ok {
-		return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "skipped", Reason: "fewer than two eligible groups have load data"})
+		return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "deferred", Reason: "no safe client move improves global pressure"})
 	}
-	ratio := math.Inf(1)
-	if target.LoadFactor > 0 {
-		ratio = source.LoadFactor / target.LoadFactor
+	binding := g.state.ClientBindings[candidate.ClientID]
+	if binding == nil {
+		return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "skipped", ClientID: candidate.ClientID, Reason: "binding disappeared during analysis"})
 	}
-	if ratio < g.cfg.ClientAffinityRebalanceMinLoadRatio {
-		return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "skipped", FromGroup: source.GroupID, ToGroup: target.GroupID, Reason: fmt.Sprintf("load ratio %.2f is below %.2f", ratio, g.cfg.ClientAffinityRebalanceMinLoadRatio), SourceTokens: source.Tokens, TargetTokens: target.Tokens, SourceLoadFactor: source.LoadFactor, TargetLoadFactor: target.LoadFactor})
-	}
-	candidate, improvement, ok := g.bestRebalanceBindingLocked(source, target, loads, snapshot.WindowStart, now)
-	if !ok {
-		return g.appendRebalanceHistoryLocked(rebalanceHistoryEntry{At: now, Action: "analyze", Result: "deferred", FromGroup: source.GroupID, ToGroup: target.GroupID, Reason: "no recently used binding is idle and outside cooldown", SourceTokens: source.Tokens, TargetTokens: target.Tokens, SourceLoadFactor: source.LoadFactor, TargetLoadFactor: target.LoadFactor})
-	}
+	source := loads[binding.GroupID]
 	entry := rebalanceHistoryEntry{At: now, Action: "analyze", Result: "recommended", ClientID: candidate.ClientID, FromGroup: source.GroupID, ToGroup: target.GroupID, Reason: "capacity-normalized Keeper load is imbalanced", SourceTokens: source.Tokens, TargetTokens: target.Tokens, SourceLoadFactor: source.LoadFactor, TargetLoadFactor: target.LoadFactor, IdleSeconds: int64(candidate.Idle.Seconds()), EstimatedTokens: candidate.Tokens, ImprovementPercent: improvement}
 	if improvement < g.cfg.ClientAffinityRebalanceMinImprove {
 		entry.Result = "skipped"
@@ -3708,7 +3813,6 @@ func (g *quotaGuard) analyzeRebalanceLocked(snapshot keeperUsageSnapshot, forceA
 	if !apply {
 		return g.appendRebalanceHistoryLocked(entry)
 	}
-	binding := g.state.ClientBindings[candidate.ClientID]
 	if binding == nil || binding.GroupID != source.GroupID {
 		entry.Result = "skipped"
 		entry.Reason = "binding changed during analysis"
@@ -3736,7 +3840,7 @@ func (g *quotaGuard) buildGroupLoadsLocked(snapshot keeperUsageSnapshot, now tim
 			continue
 		}
 		main := g.ensureAccountByKeyLocked(group.MainAuthID)
-		capacity := g.accountAffinityWeightLocked(main, now)
+		capacity := g.effectiveAffinityCapacityLocked(main, now)
 		eligible, reason := g.affinityGroupEligibleFromStateLocked(groupID, now)
 		loads[groupID] = groupLoadState{GroupID: groupID, Capacity: capacity, Eligible: eligible, Reason: reason}
 		if eligible {
@@ -3808,6 +3912,77 @@ func (g *quotaGuard) buildGroupLoadsLocked(snapshot keeperUsageSnapshot, now tim
 		loads[groupID] = load
 	}
 	return loads, nil
+}
+
+func (g *quotaGuard) buildCompositeGroupLoadsLocked(fastSnapshot, slowSnapshot keeperUsageSnapshot, now time.Time) (map[string]groupLoadState, error) {
+	fastLoads, errFast := g.buildGroupLoadsLocked(fastSnapshot, now)
+	if errFast != nil {
+		return nil, errFast
+	}
+	slowLoads, errSlow := g.buildGroupLoadsLocked(slowSnapshot, now)
+	if errSlow != nil {
+		return nil, errSlow
+	}
+	if fastSnapshot.WindowStart.Equal(slowSnapshot.WindowStart) {
+		for id, load := range slowLoads {
+			load.FastTokens = load.Tokens
+			load.SlowTokens = load.Tokens
+			load.EffectiveCapacity = load.Capacity
+			slowLoads[id] = load
+		}
+		return slowLoads, nil
+	}
+	fastMinutes := fastSnapshot.WindowEnd.Sub(fastSnapshot.WindowStart).Minutes()
+	slowMinutes := slowSnapshot.WindowEnd.Sub(slowSnapshot.WindowStart).Minutes()
+	if fastMinutes <= 0 || slowMinutes <= 0 {
+		return nil, fmt.Errorf("invalid Keeper usage windows")
+	}
+	fastWeight := g.cfg.ClientAffinityRebalanceFastWeight
+	out := make(map[string]groupLoadState, len(slowLoads))
+	totalTokens := 0.0
+	for id, slow := range slowLoads {
+		fast := fastLoads[id]
+		predictedTokens := fastWeight*(fast.Tokens/fastMinutes*slowMinutes) + (1-fastWeight)*slow.Tokens
+		predictedRequests := fastWeight*(fast.Requests/fastMinutes*slowMinutes) + (1-fastWeight)*slow.Requests
+		slow.Tokens = math.Max(0, predictedTokens)
+		slow.Requests = math.Max(0, predictedRequests)
+		slow.FastTokens = fast.Tokens
+		slow.SlowTokens = slowLoads[id].Tokens
+		slow.EffectiveCapacity = slow.Capacity
+		out[id] = slow
+		totalTokens += slow.Tokens
+	}
+	totalCapacity := 0.0
+	for _, load := range out {
+		if load.Eligible {
+			totalCapacity += load.Capacity
+		}
+	}
+	for id, load := range out {
+		if load.Eligible && totalCapacity > 0 {
+			load.TargetShare = load.Capacity / totalCapacity * 100
+		}
+		if totalTokens > 0 {
+			load.ActualShare = load.Tokens / totalTokens * 100
+		}
+		if load.TargetShare > 0 {
+			load.LoadFactor = load.ActualShare / load.TargetShare
+		}
+		out[id] = load
+	}
+	return out, nil
+}
+
+func (g *quotaGuard) effectiveAffinityCapacityLocked(account *accountState, now time.Time) float64 {
+	base := g.accountAffinityWeightLocked(account, now)
+	if account == nil || base <= 0 {
+		return 1
+	}
+	remaining, _ := g.remainingPercentLocked(account, now)
+	reserve := g.cfg.MinRemainingPercent
+	factor := (remaining - reserve) / math.Max(1, 100-reserve)
+	factor = math.Max(0.1, math.Min(1, factor))
+	return base * factor
 }
 
 func selectRebalanceGroups(loads map[string]groupLoadState) (groupLoadState, groupLoadState, bool) {
@@ -3906,6 +4081,167 @@ func (g *quotaGuard) bestRebalanceBindingLocked(source, target groupLoadState, l
 		}
 	}
 	return best, round2(bestImprove), bestImprove >= 0
+}
+
+func (g *quotaGuard) bestGlobalRebalanceMoveLocked(loads map[string]groupLoadState, fastStart, slowStart, now time.Time) (bindingLoadEstimate, groupLoadState, float64, bool) {
+	quietPeriod := time.Duration(g.cfg.ClientAffinityRebalanceIdleSecs) * time.Second
+	autoCooldown := time.Duration(g.cfg.ClientAffinityRebalanceCooldownSecs) * time.Second
+	manualCooldown := time.Duration(g.cfg.ClientAffinityManualCooldownSecs) * time.Second
+	fastMinutes := math.Max(1, now.Sub(fastStart).Minutes())
+	slowMinutes := math.Max(fastMinutes, now.Sub(slowStart).Minutes())
+	fastWeight := g.cfg.ClientAffinityRebalanceFastWeight
+	type activityTotal struct{ fastScore, slowScore, fastPicks, slowPicks float64 }
+	clientTotals := map[string]activityTotal{}
+	groupTotals := map[string]activityTotal{}
+	for _, event := range g.state.ClientActivity {
+		if event.At.Before(slowStart) {
+			continue
+		}
+		client := clientTotals[event.ClientID]
+		group := groupTotals[event.GroupID]
+		if event.Kind == "usage" {
+			client.slowScore += event.Score
+			group.slowScore += event.Score
+			if !event.At.Before(fastStart) {
+				client.fastScore += event.Score
+				group.fastScore += event.Score
+			}
+		} else if event.Kind == "pick" {
+			client.slowPicks++
+			group.slowPicks++
+			if !event.At.Before(fastStart) {
+				client.fastPicks++
+				group.fastPicks++
+			}
+		}
+		clientTotals[event.ClientID] = client
+		groupTotals[event.GroupID] = group
+	}
+	beforeMax := maxGroupPressure(loads)
+	bestImprove := -1.0
+	bestCandidate := bindingLoadEstimate{}
+	bestTarget := groupLoadState{}
+	for clientID, binding := range g.state.ClientBindings {
+		if binding == nil || binding.LastSeenAt.Before(slowStart) {
+			continue
+		}
+		if !binding.LastAutoMoveAt.IsZero() && now.Sub(binding.LastAutoMoveAt) < autoCooldown {
+			continue
+		}
+		if !binding.LastManualMoveAt.IsZero() && now.Sub(binding.LastManualMoveAt) < manualCooldown {
+			continue
+		}
+		source, okSource := loads[binding.GroupID]
+		if !okSource || !source.Eligible || source.LoadFactor < g.cfg.ClientAffinityRebalanceOverload || g.state.Rebalance.OverloadStreak[source.GroupID] < g.cfg.ClientAffinityRebalanceStreak {
+			continue
+		}
+		clientActivity := clientTotals[clientID]
+		groupActivity := groupTotals[source.GroupID]
+		clientWeight := compositeActivityWeight(clientActivity.fastScore, clientActivity.slowScore, fastMinutes, slowMinutes, fastWeight)
+		groupWeight := compositeActivityWeight(groupActivity.fastScore, groupActivity.slowScore, fastMinutes, slowMinutes, fastWeight)
+		if clientWeight <= 0 || groupWeight <= 0 {
+			clientWeight = compositeActivityWeight(clientActivity.fastPicks, clientActivity.slowPicks, fastMinutes, slowMinutes, fastWeight)
+			groupWeight = compositeActivityWeight(groupActivity.fastPicks, groupActivity.slowPicks, fastMinutes, slowMinutes, fastWeight)
+		}
+		if clientWeight <= 0 || groupWeight <= 0 {
+			continue
+		}
+		estimated := source.Tokens * clientWeight / groupWeight
+		if estimated <= 0 || estimated > source.Tokens {
+			continue
+		}
+		for targetID, target := range loads {
+			if targetID == source.GroupID || !target.Eligible || target.LoadFactor > g.cfg.ClientAffinityRebalanceTarget {
+				continue
+			}
+			simulated := cloneGroupLoads(loads)
+			sourceAfter := simulated[source.GroupID]
+			targetAfter := simulated[targetID]
+			sourceAfter.Tokens = math.Max(0, sourceAfter.Tokens-estimated)
+			targetAfter.Tokens += estimated
+			simulated[source.GroupID] = sourceAfter
+			simulated[targetID] = targetAfter
+			recomputeGroupLoadShares(simulated)
+			afterMax := maxGroupPressure(simulated)
+			rawImprovement := 0.0
+			if beforeMax > 0 {
+				rawImprovement = (beforeMax - afterMax) / beforeMax * 100
+			}
+			idle := now.Sub(binding.LastSeenAt)
+			recencyPenalty := 0.0
+			if quietPeriod > 0 && idle < quietPeriod {
+				recencyPenalty = (1 - math.Max(0, idle.Seconds())/quietPeriod.Seconds()) * 5
+			}
+			inflightPenalty := math.Min(10, float64(g.clientInflightLocked(clientID))*2)
+			improvement := rawImprovement - recencyPenalty - inflightPenalty
+			if improvement > bestImprove || (improvement == bestImprove && (clientID < bestCandidate.ClientID || bestCandidate.ClientID == "")) {
+				bestImprove = improvement
+				bestCandidate = bindingLoadEstimate{ClientID: clientID, Tokens: estimated, Idle: idle}
+				bestTarget = target
+			}
+		}
+	}
+	return bestCandidate, bestTarget, round2(bestImprove), bestImprove >= 0
+}
+
+func compositeActivityWeight(fast, slow, fastMinutes, slowMinutes, fastWeight float64) float64 {
+	return fastWeight*(fast/fastMinutes*slowMinutes) + (1-fastWeight)*slow
+}
+
+func (g *quotaGuard) clientInflightLocked(clientID string) int {
+	count := 0
+	for _, account := range g.state.Accounts {
+		if account == nil {
+			continue
+		}
+		for _, reserve := range account.Inflight {
+			if reserve.ClientID == clientID {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+func cloneGroupLoads(loads map[string]groupLoadState) map[string]groupLoadState {
+	out := make(map[string]groupLoadState, len(loads))
+	for id, load := range loads {
+		out[id] = load
+	}
+	return out
+}
+
+func recomputeGroupLoadShares(loads map[string]groupLoadState) {
+	totalTokens := 0.0
+	totalCapacity := 0.0
+	for _, load := range loads {
+		totalTokens += load.Tokens
+		if load.Eligible {
+			totalCapacity += load.Capacity
+		}
+	}
+	for id, load := range loads {
+		if load.Eligible && totalCapacity > 0 {
+			load.TargetShare = load.Capacity / totalCapacity * 100
+		}
+		if totalTokens > 0 {
+			load.ActualShare = load.Tokens / totalTokens * 100
+		}
+		if load.TargetShare > 0 {
+			load.LoadFactor = load.ActualShare / load.TargetShare
+		}
+		loads[id] = load
+	}
+}
+
+func maxGroupPressure(loads map[string]groupLoadState) float64 {
+	maxPressure := 0.0
+	for _, load := range loads {
+		if load.Eligible {
+			maxPressure = math.Max(maxPressure, load.LoadFactor)
+		}
+	}
+	return maxPressure
 }
 
 func rebalanceLoadSpread(loads map[string]groupLoadState) float64 {
@@ -4187,6 +4523,26 @@ func (g *quotaGuard) handleConfigPatch(raw []byte) ([]byte, error) {
 		case "client_affinity_rebalance_history_limit":
 			if v, ok := numberValue(value); ok {
 				cfg.ClientAffinityRebalanceHistoryLimit = int(v)
+			}
+		case "client_affinity_rebalance_fast_window_minutes":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceFastWindowMins = int64(v)
+			}
+		case "client_affinity_rebalance_fast_weight":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceFastWeight = v
+			}
+		case "client_affinity_rebalance_overload_threshold":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceOverload = v
+			}
+		case "client_affinity_rebalance_target_threshold":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceTarget = v
+			}
+		case "client_affinity_rebalance_overload_consecutive":
+			if v, ok := numberValue(value); ok {
+				cfg.ClientAffinityRebalanceStreak = int(v)
 			}
 		}
 	}
@@ -4770,12 +5126,20 @@ func renderAffinitySection(out *bytes.Buffer, affinity affinitySnapshot, account
 			}
 			out.WriteString("</td><td class=\"nowrap\">")
 			out.WriteString(formatScore(group.Tokens60m))
-			out.WriteString("<br><span class=\"muted\">actual ")
+			out.WriteString(" predicted<br><span class=\"muted\">")
+			out.WriteString(strconv.FormatInt(affinity.FastWindowMinutes, 10))
+			out.WriteString("m ")
+			out.WriteString(formatScore(group.FastTokens))
+			out.WriteString(" · 60m ")
+			out.WriteString(formatScore(group.SlowTokens))
+			out.WriteString("<br>actual ")
 			out.WriteString(fmt.Sprintf("%.2f%%", group.ActualShare))
 			out.WriteString(" · target ")
 			out.WriteString(fmt.Sprintf("%.2f%%", group.TargetShare))
 			out.WriteString("<br>factor ")
 			out.WriteString(fmt.Sprintf("%.2fx", group.LoadFactor))
+			out.WriteString(" · streak ")
+			out.WriteString(strconv.Itoa(group.OverloadStreak))
 			out.WriteString(" · capacity ")
 			out.WriteString(formatScore(group.MainCapacity))
 			out.WriteString("</span>")
