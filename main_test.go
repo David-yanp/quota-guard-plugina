@@ -20,6 +20,8 @@ func testGuard(t *testing.T) *quotaGuard {
 	now := time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC)
 	g := newQuotaGuard(func() time.Time { return now })
 	g.cfg = defaultConfig()
+	g.cfg.Default7dLimitScore = 1000000
+	g.cfg.WeeklyBudgetEnabled = false
 	g.cfg.StateFile = filepath.Join(t.TempDir(), "state.json")
 	g.cfg.QuotaSnapshotMaxAgeSecs = 900
 	return g
@@ -44,6 +46,15 @@ func affinityPickRequest(clientID string, ids ...string) pluginapi.SchedulerPick
 	}
 }
 
+func hasString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func markAccountsActive(t *testing.T, g *quotaGuard, ids ...string) {
 	t.Helper()
 	g.mu.Lock()
@@ -65,6 +76,42 @@ func TestNoStateSelectsFirstFillFirstCandidate(t *testing.T) {
 	}
 }
 
+func TestHealthObservationTracksModelConcurrencyAndOverload(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.ClientAffinityEnabled = false
+	req := pluginapi.SchedulerPickRequest{Model: "gpt-5.6-sol", Candidates: candidates("a")}
+	if _, errPick := g.pick(req); errPick != nil {
+		t.Fatal(errPick)
+	}
+	g.mu.Lock()
+	observation := g.state.Accounts["a"].HealthObservations[healthObservationKey("gpt-5.6-sol", "unknown")]
+	if observation == nil || observation.CurrentInflight != 1 || observation.MaxInflight != 1 {
+		t.Fatalf("observation after pick = %#v", observation)
+	}
+	g.mu.Unlock()
+
+	g.applyUsage(pluginapi.UsageRecord{
+		AuthID:      "a",
+		Model:       "gpt-5.6-sol",
+		RequestedAt: g.now(),
+		Failed:      true,
+		Failure: pluginapi.UsageFailure{
+			StatusCode: 503,
+			Body:       `{"error":{"code":"server_is_overloaded"}}`,
+		},
+	})
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	observation = g.state.Accounts["a"].HealthObservations[healthObservationKey("gpt-5.6-sol", "unknown")]
+	if observation == nil || observation.CurrentInflight != 0 || len(observation.Buckets) != 1 {
+		t.Fatalf("observation after completion = %#v", observation)
+	}
+	bucket := observation.Buckets[0]
+	if bucket.Requests != 1 || bucket.Failures != 1 || bucket.OverloadFailures != 1 {
+		t.Fatalf("health bucket = %#v", bucket)
+	}
+}
+
 func TestAffinityEnabledWithoutHeaderKeepsLegacyPrimary(t *testing.T) {
 	g := testGuard(t)
 	g.cfg.ClientAffinityEnabled = true
@@ -82,6 +129,152 @@ func TestAffinityEnabledWithoutHeaderKeepsLegacyPrimary(t *testing.T) {
 	}
 	if len(g.state.ClientBindings) != 0 {
 		t.Fatalf("client bindings = %#v, want none without affinity header", g.state.ClientBindings)
+	}
+}
+
+func TestNonCodexRequestPreservesCodexAffinityBinding(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.ClientAffinityEnabled = true
+	codexCandidates := candidates("codex-a.json", "codex-b.json")
+	for i := range codexCandidates {
+		codexCandidates[i].Provider = "codex"
+	}
+	resp, err := g.pick(pluginapi.SchedulerPickRequest{
+		Options:    pluginapi.SchedulerOptions{Headers: http.Header{"X-Cpa-Client-Id": []string{"client-a"}}},
+		Candidates: codexCandidates,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := g.state.ClientBindings["client-a"]
+	if binding == nil || binding.GroupID == "" {
+		t.Fatalf("binding = %#v, want Codex affinity binding", binding)
+	}
+	originalGroup := binding.GroupID
+
+	kimi := candidates("kimi.json")
+	kimi[0].Provider = "kimi"
+	resp, err = g.pick(pluginapi.SchedulerPickRequest{
+		Options:    pluginapi.SchedulerOptions{Headers: http.Header{"X-Cpa-Client-Id": []string{"client-a"}}},
+		Candidates: kimi,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AuthID != "kimi.json" {
+		t.Fatalf("AuthID = %q, want non-Codex legacy pick", resp.AuthID)
+	}
+	if got := g.state.ClientBindings["client-a"].GroupID; got != originalGroup {
+		t.Fatalf("binding group = %q, want preserved %q", got, originalGroup)
+	}
+	if _, ok := g.state.Groups[originalGroup]; !ok {
+		t.Fatalf("Codex group %q was removed by non-Codex request", originalGroup)
+	}
+}
+
+func TestExclusiveAuthLeasesOneClientUntilIdleExpiry(t *testing.T) {
+	g := testGuard(t)
+	now := g.now()
+	g.cfg.ClientAffinityExclusiveAuths = map[string]exclusiveAuthConfig{
+		"idx-a": {MaxClients: 1, IdleReleaseSeconds: 3600},
+	}
+	cs := candidates("a", "b")
+	cs[0].Attributes = map[string]string{"auth_index": "idx-a"}
+	cs[1].Attributes = map[string]string{"auth_index": "idx-b"}
+	g.mu.Lock()
+	selected, ok := g.firstEligibleGroupCandidateLocked(cs, "client-one", now)
+	if !ok || selected.ID != "a" {
+		g.mu.Unlock()
+		t.Fatalf("first selection = %#v ok=%v, want a", selected, ok)
+	}
+	g.selectGroupCandidateLocked("group-a", "client-one", "1", "gpt-5.6-sol", selected, now)
+	selected, ok = g.firstEligibleGroupCandidateLocked(cs, "client-two", now)
+	if !ok || selected.ID != "b" {
+		g.mu.Unlock()
+		t.Fatalf("second selection = %#v ok=%v, want b while a is leased", selected, ok)
+	}
+	selected, ok = g.firstEligibleGroupCandidateLocked(cs, "client-one", now.Add(30*time.Minute))
+	if !ok || selected.ID != "a" {
+		g.mu.Unlock()
+		t.Fatalf("owner selection = %#v ok=%v, want a", selected, ok)
+	}
+	selected, ok = g.firstEligibleGroupCandidateLocked(cs, "client-two", now.Add(61*time.Minute))
+	g.mu.Unlock()
+	if !ok || selected.ID != "a" {
+		t.Fatalf("expired selection = %#v ok=%v, want a", selected, ok)
+	}
+}
+
+func TestExclusiveAuthCannotBeClaimedWithoutClientID(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.ClientAffinityExclusiveAuths = map[string]exclusiveAuthConfig{
+		"idx-a": {MaxClients: 1, IdleReleaseSeconds: 3600, AllowClientlessClaim: false},
+	}
+	cs := candidates("a", "b")
+	cs[0].Attributes = map[string]string{"auth_index": "idx-a"}
+	cs[1].Attributes = map[string]string{"auth_index": "idx-b"}
+	resp, errPick := g.pick(pluginapi.SchedulerPickRequest{Model: "gpt-5.6-sol", Candidates: cs})
+	if errPick != nil {
+		t.Fatal(errPick)
+	}
+	if resp.AuthID != "b" {
+		t.Fatalf("AuthID = %q, want b because clientless requests cannot claim a", resp.AuthID)
+	}
+}
+
+func TestLegacyPrimaryAuthIsPreferredWithoutAffinityHeader(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.ClientAffinityEnabled = true
+	g.cfg.LegacyPrimaryAuth = "idx-b"
+	g.mu.Lock()
+	g.ensureAccountByKeyLocked("b").AuthIndex = "idx-b"
+	g.state.CurrentAuthID = "a"
+	g.mu.Unlock()
+
+	resp, err := g.pick(pluginapi.SchedulerPickRequest{Candidates: candidates("a", "b")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AuthID != "b" {
+		t.Fatalf("AuthID = %q, want configured legacy primary b", resp.AuthID)
+	}
+}
+
+func TestLegacyPrimaryAuthFallsBackWhenUnavailable(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.LegacyPrimaryAuth = "b"
+	g.mu.Lock()
+	account := g.ensureAccountByKeyLocked("b")
+	account.Status = "active"
+	account.Events = append(account.Events, usageEvent{At: g.now(), Score: 950000})
+	g.mu.Unlock()
+
+	resp, err := g.pick(pluginapi.SchedulerPickRequest{Candidates: candidates("a", "b")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AuthID != "a" {
+		t.Fatalf("AuthID = %q, want fallback candidate a", resp.AuthID)
+	}
+}
+
+func TestConfiguredProAffinityGroupIsStandalone(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.ClientAffinityEnabled = true
+	g.cfg.ClientAffinityGroups = map[string][]string{"pro-b62": {"idx-b"}}
+	g.mu.Lock()
+	account := g.ensureAccountByKeyLocked("b")
+	account.AuthIndex = "idx-b"
+	g.mu.Unlock()
+
+	if _, err := g.pick(affinityPickRequest("client-pro", "a", "b")); err != nil {
+		t.Fatal(err)
+	}
+	g.mu.Lock()
+	group := g.state.Groups["pro-b62"]
+	g.mu.Unlock()
+	if group == nil || len(group.Members) != 1 || group.MainAuthID != "b" {
+		t.Fatalf("pro group = %#v, want standalone b group", group)
 	}
 }
 
@@ -156,8 +349,73 @@ func TestAffinityRebindsWhenBoundGroupUnavailable(t *testing.T) {
 	if resp.AuthID != "c" {
 		t.Fatalf("AuthID = %q, want c from re-bound group-two", resp.AuthID)
 	}
-	if got := g.state.ClientBindings["client-a"].GroupID; got != "group-two" {
-		t.Fatalf("binding group = %q, want group-two", got)
+	if got := g.state.ClientBindings["client-a"].GroupID; got != "group-one" {
+		t.Fatalf("binding group = %q, want original group-one during temporary failover", got)
+	}
+	if got := g.state.ClientBindings["client-a"].LastFailoverGroupID; got != "group-two" {
+		t.Fatalf("failover group = %q, want group-two", got)
+	}
+	if got := g.state.ClientBindings["client-a"].FailoverCount; got != 1 {
+		t.Fatalf("failover count = %d, want 1", got)
+	}
+}
+
+func TestAffinityPersistsRebindWhenBoundGroupWasRemoved(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.ClientAffinityEnabled = true
+	g.cfg.ClientAffinityGroups = map[string][]string{
+		"group-two": {"c", "d"},
+	}
+	g.state.ClientBindings["client-a"] = &clientBindingState{ClientID: "client-a", GroupID: "removed-group"}
+
+	resp, err := g.pick(affinityPickRequest("client-a", "c", "d"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AuthID != "c" {
+		t.Fatalf("AuthID = %q, want c from replacement group", resp.AuthID)
+	}
+	binding := g.state.ClientBindings["client-a"]
+	if binding == nil || binding.GroupID != "group-two" {
+		t.Fatalf("binding = %#v, want persisted group-two", binding)
+	}
+	if !strings.Contains(binding.LastMoveReason, "topology rebind: removed-group removed -> group-two") {
+		t.Fatalf("move reason = %q", binding.LastMoveReason)
+	}
+}
+
+func TestFreshQuotaSnapshotDoesNotDeductDiagnosticUsage(t *testing.T) {
+	g := testGuard(t)
+	g.mu.Lock()
+	account := g.ensureAccountByKeyLocked("a")
+	snapshotAt := g.now().Add(-time.Minute)
+	account.Limits[window7d] = 1000
+	account.ActiveWindows[window5h] = false
+	account.ActiveWindows[window7d] = true
+	account.QuotaSnapshots[window7d] = quotaWindowSnapshot{At: snapshotAt, LimitScore: 1000, RemainingPercent: 80}
+	account.Events = append(account.Events, usageEvent{At: g.now().Add(-30 * time.Second), Score: 100})
+	remaining, windows := g.remainingPercentLocked(account, g.now())
+	g.mu.Unlock()
+
+	if remaining != 80 || windows[window7d] != 80 {
+		t.Fatalf("remaining = %.2f windows=%#v, want fresh official snapshot 80", remaining, windows)
+	}
+}
+
+func TestExpiredQuotaSnapshotRemainsConservativeWithLocalUsage(t *testing.T) {
+	g := testGuard(t)
+	g.mu.Lock()
+	account := g.ensureAccountByKeyLocked("a")
+	account.Limits[window7d] = 1000
+	account.ActiveWindows[window5h] = false
+	account.ActiveWindows[window7d] = true
+	account.QuotaSnapshots[window7d] = quotaWindowSnapshot{At: g.now().Add(-2 * time.Hour), LimitScore: 1000, RemainingPercent: 99}
+	account.Events = append(account.Events, usageEvent{At: g.now().Add(-time.Minute), Score: 300})
+	remaining, windows := g.remainingPercentLocked(account, g.now())
+	g.mu.Unlock()
+
+	if remaining != 69 || windows[window7d] != 69 {
+		t.Fatalf("remaining = %.2f windows=%#v, want stale baseline minus local usage 69", remaining, windows)
 	}
 }
 
@@ -212,6 +470,138 @@ func TestAffinityAutoGroupsWeightProIntoMoreGroups(t *testing.T) {
 	}
 }
 
+func TestRepeatableProCanBeStandaloneAndBackup(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.ClientAffinityEnabled = true
+	g.cfg.ClientAffinityRepeatableAuths = []string{"pro"}
+	g.cfg.ClientAffinityGroups = map[string][]string{"pro-standalone": {"pro"}}
+
+	if _, err := g.pick(affinityPickRequest("client-a", "plus-a", "plus-b", "pro")); err != nil {
+		t.Fatal(err)
+	}
+
+	standalone := g.state.Groups["pro-standalone"]
+	if standalone == nil || len(standalone.Members) != 1 || standalone.MainAuthID != "pro" {
+		t.Fatalf("standalone group = %#v, want pro as its only main member", standalone)
+	}
+	for _, id := range []string{"plus-a", "plus-b"} {
+		groupID := stableAutoAffinityGroupID(g.state.Accounts[id])
+		group := g.state.Groups[groupID]
+		if group == nil || !hasString(group.BackupAuthIDs, "pro") {
+			t.Fatalf("group %q = %#v, want pro as backup", groupID, group)
+		}
+	}
+}
+
+func TestMinimumLoadPrefersEmptyEligibleGroups(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.ClientAffinityEnabled = true
+	g.cfg.ClientAffinityMinLoadEnabled = true
+	g.cfg.ClientAffinityMinBindingPerGroup = 1
+	g.cfg.ClientAffinityGroups = map[string][]string{
+		"group-a": {"a"},
+		"group-b": {"b"},
+		"group-c": {"c"},
+	}
+
+	first := affinityPickRequest("client-a", "a", "b", "c")
+	first.Options.Metadata = map[string]any{"api_key_id": float64(42)}
+	if _, err := g.pick(first); err != nil {
+		t.Fatal(err)
+	}
+	second := affinityPickRequest("client-b", "a", "b", "c")
+	if _, err := g.pick(second); err != nil {
+		t.Fatal(err)
+	}
+	if g.state.ClientBindings["client-a"].GroupID == g.state.ClientBindings["client-b"].GroupID {
+		t.Fatalf("bindings = %#v, want distinct empty groups", g.state.ClientBindings)
+	}
+	if got := g.state.ClientBindings["client-a"].APIKeyID; got != "42" {
+		t.Fatalf("api key id = %q, want 42", got)
+	}
+}
+
+func TestMinimumLoadTreatsStaleBindingAsDormant(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.ClientAffinityEnabled = true
+	g.cfg.ClientAffinityMinLoadEnabled = true
+	g.cfg.ClientAffinityDormantSecs = int64((24 * time.Hour).Seconds())
+	g.cfg.ClientAffinityGroups = map[string][]string{
+		"group-a": {"a"},
+		"group-b": {"b"},
+	}
+	g.state.ClientBindings["stale-client"] = &clientBindingState{
+		ClientID:   "stale-client",
+		GroupID:    "group-b",
+		LastSeenAt: g.now().Add(-48 * time.Hour),
+	}
+	g.rebuildAffinityGroupsLocked(candidates("a", "b"), g.now())
+
+	group, _, ok := g.assignAffinityGroupLocked("fresh-client", candidates("a", "b"), g.now())
+	if !ok || group != "group-a" {
+		t.Fatalf("group = %q ok=%v, want group-a before group-b receives a real request", group, ok)
+	}
+
+	loads, err := g.buildGroupLoadsLocked(rebalanceSnapshot(g, 10, 10), g.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loads["group-b"].ActiveBindingCount; got != 0 {
+		t.Fatalf("group-b active bindings = %d, want 0", got)
+	}
+	if got := loads["group-b"].FloorState; got != "missing active binding" {
+		t.Fatalf("group-b floor = %q, want missing active binding", got)
+	}
+}
+
+func TestAPIKeyUsageRequiresObservedHeaderRoute(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	g.state.ClientBindings["client-a"] = &clientBindingState{ClientID: "client-a", GroupID: "group-a", APIKeyID: "42", LastSeenAt: g.now().Add(-2 * time.Hour)}
+	g.state.Rebalance.APIKeyUsage = map[string]keeperUsageItem{
+		"42": {AuthIndex: "42", Tokens: 50, Requests: 5},
+	}
+	g.rebuildAffinityGroupsLocked(g.affinitySnapshotCandidatesLocked(), g.now())
+
+	loads, err := g.buildGroupLoadsLocked(rebalanceSnapshot(g, 100, 0), g.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loads["group-a"].APIKeyTokens; got != 0 {
+		t.Fatalf("unobserved API key tokens = %.2f, want 0", got)
+	}
+	if got := loads["group-a"].Tokens; got != 100 {
+		t.Fatalf("unobserved API key group tokens = %.2f, want auth-only 100", got)
+	}
+
+	g.state.ClientActivity = append(g.state.ClientActivity, clientActivityEvent{At: g.now().Add(-time.Minute), ClientID: "client-a", APIKeyID: "42", GroupID: "group-a", AuthID: "a", Kind: "pick"})
+	loads, err = g.buildGroupLoadsLocked(rebalanceSnapshot(g, 100, 0), g.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loads["group-a"].APIKeyTokens; got != 50 {
+		t.Fatalf("observed API key tokens = %.2f, want 50", got)
+	}
+	if got := loads["group-a"].Tokens; got != 100 {
+		t.Fatalf("observed API key group tokens = %.2f, want deduplicated 100", got)
+	}
+}
+
+func TestClientAffinityUsesConfiguredAPIKeyMapping(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.ClientAffinityEnabled = true
+	g.cfg.ClientAffinityAPIKeyMap = map[string]string{"client-a": "23"}
+	identity, ok := g.clientAffinityIdentity(affinityPickRequest("client-a", "a"))
+	if !ok || identity.APIKeyID != "23" {
+		t.Fatalf("identity = %#v, ok=%v, want configured API key ID 23", identity, ok)
+	}
+	req := affinityPickRequest("client-a", "a")
+	req.Options.Metadata = map[string]any{"api_key_id": float64(7)}
+	identity, ok = g.clientAffinityIdentity(req)
+	if !ok || identity.APIKeyID != "7" {
+		t.Fatalf("identity = %#v, ok=%v, want metadata API key ID 7", identity, ok)
+	}
+}
+
 func TestAffinityAutoGroupsDoNotRepeatRegularAccountsWithoutPro(t *testing.T) {
 	g := testGuard(t)
 	g.cfg.ClientAffinityEnabled = true
@@ -228,6 +618,26 @@ func TestAffinityAutoGroupsDoNotRepeatRegularAccountsWithoutPro(t *testing.T) {
 		if groupCount[id] != 1 {
 			t.Fatalf("group counts = %#v, want %s in exactly one group", groupCount, id)
 		}
+	}
+}
+
+func TestAffinityCapacityUsesTheTightestWeeklyOrMonthlyWindow(t *testing.T) {
+	g := testGuard(t)
+	g.mu.Lock()
+	account := g.ensureAccountByKeyLocked("a")
+	account.Limits = map[string]float64{window7d: 10000, windowMonthly: 100000}
+	account.ActiveWindows = map[string]bool{window7d: true, windowMonthly: true}
+	account.QuotaSnapshots = map[string]quotaWindowSnapshot{
+		window7d:      {At: g.now(), LimitScore: 10000, RemainingPercent: 50},
+		windowMonthly: {At: g.now(), LimitScore: 100000, RemainingPercent: 90},
+	}
+	capacity := g.effectiveAffinityCapacityLocked(account, g.now())
+	g.mu.Unlock()
+
+	// The weekly window leaves 40% of 10000 after the 10% reserve. The larger
+	// monthly budget must not make the account look more capable.
+	if capacity != 4000 {
+		t.Fatalf("capacity = %.2f, want 4000", capacity)
 	}
 }
 
@@ -650,10 +1060,10 @@ func TestDisabledCandidatesAreNotEligible(t *testing.T) {
 	}
 }
 
-func TestNonActiveStatusIsNotEligible(t *testing.T) {
+func TestHardUnavailableStatusIsNotEligible(t *testing.T) {
 	g := testGuard(t)
 	resp, err := g.pick(pluginapi.SchedulerPickRequest{Candidates: []pluginapi.SchedulerAuthCandidate{
-		{ID: "a", Priority: 10, Status: "error"},
+		{ID: "a", Priority: 10, Status: "unavailable"},
 		{ID: "b", Priority: 9, Status: "active"},
 	}})
 	if err != nil {
@@ -664,9 +1074,45 @@ func TestNonActiveStatusIsNotEligible(t *testing.T) {
 	}
 	snapshot := g.snapshot(false)
 	for _, account := range snapshot.Accounts {
-		if account.AuthID == "a" && (account.Eligible || account.Reason != "status error") {
-			t.Fatalf("account a = %#v, want status error rejection", account)
+		if account.AuthID == "a" && (account.Eligible || account.Reason != "unavailable") {
+			t.Fatalf("account a = %#v, want unavailable rejection", account)
 		}
+	}
+}
+
+func TestSchedulerTrustsHostCandidateWithStaleErrorStatus(t *testing.T) {
+	g := testGuard(t)
+	resp, err := g.pick(pluginapi.SchedulerPickRequest{Candidates: []pluginapi.SchedulerAuthCandidate{
+		{ID: "plus", Provider: "codex", Priority: 10, Status: "error"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AuthID != "plus" {
+		t.Fatalf("AuthID = %q, want host-routable candidate plus", resp.AuthID)
+	}
+}
+
+func TestAffinityUsesProBackupWhenMainIsHardUnavailable(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.ClientAffinityEnabled = true
+	g.cfg.ClientAffinityGroups = map[string][]string{"team-with-pro": {"plus", "pro"}}
+	g.mu.Lock()
+	g.state.ClientBindings["client-a"] = &clientBindingState{GroupID: "team-with-pro"}
+	g.mu.Unlock()
+
+	resp, err := g.pick(pluginapi.SchedulerPickRequest{
+		Options: pluginapi.SchedulerOptions{Headers: map[string][]string{"X-CPA-Client-ID": {"client-a"}}},
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "plus", Provider: "codex", Priority: 10, Status: "unavailable"},
+			{ID: "pro", Provider: "codex", Priority: 10, Status: "error"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.AuthID != "pro" {
+		t.Fatalf("AuthID = %q, want Pro backup", resp.AuthID)
 	}
 }
 
@@ -698,6 +1144,38 @@ func TestRequestScopedErrorStatusCanRemainEligible(t *testing.T) {
 				t.Fatalf("eligible = %v reason=%q, want request-scoped error eligible", eligible, reason)
 			}
 		})
+	}
+}
+
+func TestRetryableServerOverloadDoesNotExcludeAccount(t *testing.T) {
+	g := testGuard(t)
+	g.mu.Lock()
+	account := g.ensureAccountByKeyLocked("a")
+	account.Status = "error"
+	account.Unavailable = true
+	account.NextRetryAfter = g.now().Add(2 * time.Minute)
+	account.StatusMessage = `{"error":{"type":"service_unavailable_error","code":"server_is_overloaded"}}`
+	remaining, windows := g.remainingPercentLocked(account, g.now())
+	eligible, reason := g.accountEligibleLocked(account, remaining, windows, g.now())
+	g.mu.Unlock()
+	if !eligible || reason != "" {
+		t.Fatalf("eligible = %v reason=%q, want overloaded auth to remain retryable", eligible, reason)
+	}
+}
+
+func TestLongTransientCooldownStillExcludesAccount(t *testing.T) {
+	g := testGuard(t)
+	g.mu.Lock()
+	account := g.ensureAccountByKeyLocked("a")
+	account.Status = "error"
+	account.Unavailable = true
+	account.NextRetryAfter = g.now().Add(4 * time.Minute)
+	account.StatusMessage = "server_is_overloaded"
+	remaining, windows := g.remainingPercentLocked(account, g.now())
+	eligible, reason := g.accountEligibleLocked(account, remaining, windows, g.now())
+	g.mu.Unlock()
+	if eligible || reason != "unavailable" {
+		t.Fatalf("eligible = %v reason=%q, want long overload cooldown rejected", eligible, reason)
 	}
 }
 
@@ -856,7 +1334,7 @@ func TestCalibrationDoesNotFreezeRemaining(t *testing.T) {
 	g := testGuard(t)
 	g.applyUsage(pluginapi.UsageRecord{AuthID: "a", RequestedAt: g.now(), Detail: pluginapi.UsageDetail{InputTokens: 1000}})
 	pct := 50.0
-	if err := g.calibrate(calibrateRequest{AuthID: "a", Window: window5h, RemainingPercent: &pct}); err != nil {
+	if err := g.calibrate(calibrateRequest{AuthID: "a", Window: window7d, RemainingPercent: &pct}); err != nil {
 		t.Fatal(err)
 	}
 	g.applyUsage(pluginapi.UsageRecord{AuthID: "a", RequestedAt: g.now(), Detail: pluginapi.UsageDetail{InputTokens: 100}})
@@ -905,14 +1383,256 @@ func TestCodexQuotaSnapshotFeedsRemaining(t *testing.T) {
 	remaining, windows := g.remainingPercentLocked(account, g.now())
 	g.mu.Unlock()
 	if remaining != 66 {
-		t.Fatalf("remaining = %.2f, want 66", remaining)
+		t.Fatalf("remaining = %.2f, want primary 5h 66", remaining)
 	}
 	if windows[window5h] != 66 || windows[window7d] != 93 {
-		t.Fatalf("windows = %#v, want 5h=66 7d=93", windows)
+		t.Fatalf("windows = %#v, want 5h=66 and weekly=93", windows)
 	}
 }
 
-func TestFiveHourRemainingDrivesDecisionWhenWeeklyIsLower(t *testing.T) {
+func TestWeeklyCapacityUsesReportedLimitAndRemaining(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.WeeklyBudgetEnabled = false
+	g.mu.Lock()
+	huahe := g.ensureAccountByKeyLocked("huahe")
+	huahe.ActiveWindows[window7d] = true
+	huahe.QuotaSnapshots[window7d] = quotaWindowSnapshot{At: g.now(), RemainingPercent: 98, LimitScore: 200000000, PlanType: "pro"}
+	hxjlove := g.ensureAccountByKeyLocked("hxjlove")
+	hxjlove.ActiveWindows[window7d] = true
+	hxjlove.QuotaSnapshots[window7d] = quotaWindowSnapshot{At: g.now(), RemainingPercent: 92, LimitScore: 200000000, PlanType: "pro"}
+	huaheCapacity := g.effectiveAffinityCapacityLocked(huahe, g.now())
+	hxjloveCapacity := g.effectiveAffinityCapacityLocked(hxjlove, g.now())
+	g.mu.Unlock()
+	if huaheCapacity != 176000000 || hxjloveCapacity != 164000000 {
+		t.Fatalf("capacities = %.0f/%.0f, want 176000000/164000000", huaheCapacity, hxjloveCapacity)
+	}
+}
+
+func TestWeeklyBudgetAdjustmentAppliesOnlyAfterLocalDateChanges(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.WeeklyBudgetEnabled = true
+	g.cfg.WeeklyBudgetTimezoneOffsetHours = 8
+	g.cfg.WeeklyBudgetMaxAdjustmentPercent = 20
+	start := g.now()
+	resetAt := start.Add(4 * 24 * time.Hour)
+	account := g.ensureAccountByKeyLocked("a")
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: start, RemainingPercent: 80, ResetAt: &resetAt}, start)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: start.Add(time.Hour), RemainingPercent: 79, ResetAt: &resetAt}, start.Add(time.Hour))
+	if got := g.weeklyBudgetMultiplierLocked(account); got != 1 {
+		t.Fatalf("same-day multiplier = %.4f, want 1", got)
+	}
+	nextDay := start.Add(24 * time.Hour)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: nextDay, RemainingPercent: 78, ResetAt: &resetAt}, nextDay)
+	if got := g.weeklyBudgetMultiplierLocked(account); got <= 1 || got > 1.2 {
+		t.Fatalf("next-day multiplier = %.4f, want underuse boost within 1.2", got)
+	}
+	if account.WeeklyBudget.LastDailyBurnPercent != 2 {
+		t.Fatalf("daily burn = %.2f, want 2 from first daily samples", account.WeeklyBudget.LastDailyBurnPercent)
+	}
+}
+
+func TestWeeklyBudgetAdjustmentThrottlesOveruseAndClamps(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.WeeklyBudgetEnabled = true
+	g.cfg.WeeklyBudgetMaxAdjustmentPercent = 20
+	start := g.now()
+	resetAt := start.Add(4 * 24 * time.Hour)
+	account := g.ensureAccountByKeyLocked("a")
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: start, RemainingPercent: 80, ResetAt: &resetAt}, start)
+	nextDay := start.Add(24 * time.Hour)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: nextDay, RemainingPercent: 20, ResetAt: &resetAt}, nextDay)
+	if got := g.weeklyBudgetMultiplierLocked(account); got < 0.8 || got >= 1 {
+		t.Fatalf("overuse multiplier = %.4f, want throttled within 0.8..1", got)
+	}
+}
+
+func TestWeeklyBudgetSamplesUseUTC8MidnightBoundaries(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.WeeklyBudgetEnabled = true
+	g.cfg.WeeklyBudgetTimezoneOffsetHours = 8
+	account := g.ensureAccountByKeyLocked("a")
+	firstObserved := time.Date(2026, 8, 20, 16, 2, 0, 0, time.UTC)
+	resetAt := time.Date(2026, 8, 27, 3, 30, 0, 0, time.UTC)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: firstObserved, RemainingPercent: 98, ResetAt: &resetAt}, firstObserved)
+	secondObserved := time.Date(2026, 8, 21, 16, 3, 0, 0, time.UTC)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: secondObserved, RemainingPercent: 95, ResetAt: &resetAt}, secondObserved)
+	if len(account.WeeklyBudget.Samples) != 2 {
+		t.Fatalf("samples = %#v, want two UTC+8 daily samples", account.WeeklyBudget.Samples)
+	}
+	if got := account.WeeklyBudget.Samples[0].At; !got.Equal(time.Date(2026, 8, 20, 16, 0, 0, 0, time.UTC)) {
+		t.Fatalf("first day start = %v", got)
+	}
+	if got := account.WeeklyBudget.Samples[1].At; !got.Equal(time.Date(2026, 8, 21, 16, 0, 0, 0, time.UTC)) {
+		t.Fatalf("second day start = %v", got)
+	}
+	if account.WeeklyBudget.LastDailyBurnPercent != 3 {
+		t.Fatalf("daily burn = %.2f, want 3", account.WeeklyBudget.LastDailyBurnPercent)
+	}
+}
+
+func TestWeeklyBudgetResetDriftDoesNotDiscardSamples(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.WeeklyBudgetEnabled = true
+	account := g.ensureAccountByKeyLocked("a")
+	first := g.now()
+	stableReset := first.Add(5 * 24 * time.Hour)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: first, RemainingPercent: 90, ResetAt: &stableReset}, first)
+	driftedReset := stableReset.Add(17 * time.Minute)
+	nextDay := first.Add(24 * time.Hour)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: nextDay, RemainingPercent: 85, ResetAt: &driftedReset}, nextDay)
+	if len(account.WeeklyBudget.Samples) != 2 {
+		t.Fatalf("samples = %#v, want drift preserved across two days", account.WeeklyBudget.Samples)
+	}
+	if !account.WeeklyBudget.CycleResetAt.Equal(stableReset) {
+		t.Fatalf("cycle reset = %v, want stable %v", account.WeeklyBudget.CycleResetAt, stableReset)
+	}
+	if account.WeeklyBudget.ResetDriftSeconds != int64((17 * time.Minute).Seconds()) {
+		t.Fatalf("reset drift = %d", account.WeeklyBudget.ResetDriftSeconds)
+	}
+}
+
+func TestWeeklyBudgetEarlyResetNearFullStartsNewCycle(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.WeeklyBudgetEnabled = true
+	account := g.ensureAccountByKeyLocked("a")
+	first := g.now()
+	oldReset := first.Add(4 * 24 * time.Hour)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: first, RemainingPercent: 41, ResetAt: &oldReset}, first)
+
+	nextDay := first.Add(24 * time.Hour)
+	newReset := oldReset.Add(4 * 24 * time.Hour)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: nextDay, RemainingPercent: 100, ResetAt: &newReset}, nextDay)
+
+	if len(account.WeeklyBudget.Samples) != 1 || !account.WeeklyBudget.CycleResetAt.Equal(newReset) {
+		t.Fatalf("budget = %#v, want one early-reset baseline", account.WeeklyBudget)
+	}
+	if account.WeeklyBudget.Samples[0].RemainingPercent != 100 {
+		t.Fatalf("remaining = %.2f, want new baseline 100", account.WeeklyBudget.Samples[0].RemainingPercent)
+	}
+	if account.WeeklyBudget.AdjustmentMultiplier != 1 || account.WeeklyBudget.Reason != "early weekly cycle reset baseline" {
+		t.Fatalf("new cycle multiplier/reason = %.2f/%q", account.WeeklyBudget.AdjustmentMultiplier, account.WeeklyBudget.Reason)
+	}
+}
+
+func TestWeeklyBudgetEarlyResetLargeRefillStartsNewCycle(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.WeeklyBudgetEnabled = true
+	account := g.ensureAccountByKeyLocked("a")
+	first := g.now()
+	oldReset := first.Add(4 * 24 * time.Hour)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: first, RemainingPercent: 30, ResetAt: &oldReset}, first)
+
+	nextDay := first.Add(24 * time.Hour)
+	newReset := oldReset.Add(4 * 24 * time.Hour)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: nextDay, RemainingPercent: 70, ResetAt: &newReset}, nextDay)
+
+	if len(account.WeeklyBudget.Samples) != 1 || !account.WeeklyBudget.CycleResetAt.Equal(newReset) {
+		t.Fatalf("budget = %#v, want large refill to start a new cycle", account.WeeklyBudget)
+	}
+}
+
+func TestWeeklyBudgetAdvancedResetWithoutRefillRemainsDrift(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.WeeklyBudgetEnabled = true
+	account := g.ensureAccountByKeyLocked("a")
+	first := g.now()
+	oldReset := first.Add(4 * 24 * time.Hour)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: first, RemainingPercent: 60, ResetAt: &oldReset}, first)
+
+	nextDay := first.Add(24 * time.Hour)
+	newReset := oldReset.Add(4 * 24 * time.Hour)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: nextDay, RemainingPercent: 55, ResetAt: &newReset}, nextDay)
+
+	if len(account.WeeklyBudget.Samples) != 2 || !account.WeeklyBudget.CycleResetAt.Equal(oldReset) {
+		t.Fatalf("budget = %#v, want advanced reset without refill treated as drift", account.WeeklyBudget)
+	}
+	if account.WeeklyBudget.ResetDriftSeconds != int64((4 * 24 * time.Hour).Seconds()) {
+		t.Fatalf("reset drift = %d", account.WeeklyBudget.ResetDriftSeconds)
+	}
+}
+
+func TestWeeklyBudgetSmallResetDriftNearFullDoesNotStartNewCycle(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.WeeklyBudgetEnabled = true
+	account := g.ensureAccountByKeyLocked("a")
+	first := g.now()
+	oldReset := first.Add(4 * 24 * time.Hour)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: first, RemainingPercent: 96, ResetAt: &oldReset}, first)
+
+	nextDay := first.Add(24 * time.Hour)
+	driftedReset := oldReset.Add(30 * time.Minute)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: nextDay, RemainingPercent: 100, ResetAt: &driftedReset}, nextDay)
+
+	if len(account.WeeklyBudget.Samples) != 2 || !account.WeeklyBudget.CycleResetAt.Equal(oldReset) {
+		t.Fatalf("budget = %#v, want small reset drift to preserve samples", account.WeeklyBudget)
+	}
+}
+
+func TestWeeklyBudgetRealResetStartsNewCycleAfterOldBoundary(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.WeeklyBudgetEnabled = true
+	account := g.ensureAccountByKeyLocked("a")
+	first := g.now()
+	oldReset := first.Add(2 * time.Hour)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: first, RemainingPercent: 20, ResetAt: &oldReset}, first)
+	newReset := oldReset.Add(7 * 24 * time.Hour)
+	afterReset := oldReset.Add(time.Minute)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: afterReset, RemainingPercent: 100, ResetAt: &newReset}, afterReset)
+	if len(account.WeeklyBudget.Samples) != 1 || !account.WeeklyBudget.CycleResetAt.Equal(newReset) {
+		t.Fatalf("budget = %#v, want one new-cycle baseline", account.WeeklyBudget)
+	}
+	if account.WeeklyBudget.AdjustmentMultiplier != 1 || account.WeeklyBudget.Reason != "new weekly cycle baseline" {
+		t.Fatalf("new cycle multiplier/reason = %.2f/%q", account.WeeklyBudget.AdjustmentMultiplier, account.WeeklyBudget.Reason)
+	}
+}
+
+func TestWeeklyBudgetPartialDayDoesNotAdjust(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.WeeklyBudgetEnabled = true
+	account := g.ensureAccountByKeyLocked("a")
+	first := time.Date(2026, 8, 21, 8, 30, 0, 0, time.UTC)
+	resetAt := time.Date(2026, 8, 27, 3, 30, 0, 0, time.UTC)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: first, RemainingPercent: 90, ResetAt: &resetAt}, first)
+	nextMidnight := time.Date(2026, 8, 21, 16, 2, 0, 0, time.UTC)
+	g.updateWeeklyBudgetLocked(account, quotaWindowSnapshot{At: nextMidnight, RemainingPercent: 85, ResetAt: &resetAt}, nextMidnight)
+	if got := g.weeklyBudgetMultiplierLocked(account); got != 1 {
+		t.Fatalf("partial-day multiplier = %.4f, want 1", got)
+	}
+	if !strings.Contains(account.WeeklyBudget.Reason, "waiting for full UTC+8 day") {
+		t.Fatalf("reason = %q", account.WeeklyBudget.Reason)
+	}
+}
+
+func TestFailedRefreshKeepsSuccessSnapshotAndReportsExpiredFailure(t *testing.T) {
+	g := testGuard(t)
+	successAt := g.now().Add(-time.Hour)
+	g.mu.Lock()
+	account := g.ensureAccountByKeyLocked("a")
+	account.AuthIndex = "idx-a"
+	account.ActiveWindows[window7d] = true
+	account.QuotaSnapshots[window7d] = quotaWindowSnapshot{At: successAt, Source: "test", RemainingPercent: 80, LimitScore: 100}
+	account.LastQuotaRefreshAt = successAt
+	g.mu.Unlock()
+
+	result := g.applyAuthJSONQuota(pluginapi.HostAuthFileEntry{ID: "a", AuthIndex: "idx-a", Provider: "codex"}, json.RawMessage(`{"type":"codex"}`), "auth_json")
+	if result.Error == "" {
+		t.Fatal("refresh error is empty, want missing codex quota error")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	account = g.ensureAccountByKeyLocked("a")
+	if !account.LastQuotaRefreshAt.Equal(successAt) {
+		t.Fatalf("last success = %v, want %v", account.LastQuotaRefreshAt, successAt)
+	}
+	if !account.LastQuotaRefreshAttemptAt.Equal(g.now()) {
+		t.Fatalf("last attempt = %v, want %v", account.LastQuotaRefreshAttemptAt, g.now())
+	}
+	if got := quotaMode(account, g.now(), g.cfg); got != "snapshot expired; refresh failed" {
+		t.Fatalf("quota mode = %q", got)
+	}
+}
+
+func TestFiveHourIsPrimaryDisplayWhileWeeklyStillGuardsEligibility(t *testing.T) {
 	g := testGuard(t)
 	raw := json.RawMessage(`{
 		"codex_quota": {
@@ -932,17 +1652,17 @@ func TestFiveHourRemainingDrivesDecisionWhenWeeklyIsLower(t *testing.T) {
 	eligible, reason := g.accountEligibleLocked(account, remaining, windows, g.now())
 	g.mu.Unlock()
 	if remaining != 86 {
-		t.Fatalf("remaining = %.2f, want 5h-driven 86", remaining)
+		t.Fatalf("remaining = %.2f, want primary 5h 86", remaining)
 	}
 	if windows[window5h] != 86 || windows[window7d] != 20 {
-		t.Fatalf("windows = %#v, want 5h=86 7d=20", windows)
+		t.Fatalf("windows = %#v, want 5h=86 and weekly=20", windows)
 	}
 	if !eligible || reason != "" {
-		t.Fatalf("eligible = %v reason=%q, want eligible because 5h is above reserve", eligible, reason)
+		t.Fatalf("eligible = %v reason=%q, want weekly 20 above reserve", eligible, reason)
 	}
 }
 
-func TestWeeklyCapacityMustCoverFiveHourToReserve(t *testing.T) {
+func TestWeeklyBelowReserveIsIneligible(t *testing.T) {
 	g := testGuard(t)
 	raw := json.RawMessage(`{
 		"codex_quota": {
@@ -960,19 +1680,46 @@ func TestWeeklyCapacityMustCoverFiveHourToReserve(t *testing.T) {
 		t.Fatal(err)
 	}
 	if resp.AuthID != "b" {
-		t.Fatalf("AuthID = %q, want b because weekly cannot cover 5h-to-reserve", resp.AuthID)
+		t.Fatalf("AuthID = %q, want b because weekly is below reserve", resp.AuthID)
 	}
 	g.mu.Lock()
 	account := g.ensureAccountByKeyLocked("a")
 	remaining, windows := g.remainingPercentLocked(account, g.now())
 	eligible, reason := g.accountEligibleLocked(account, remaining, windows, g.now())
 	g.mu.Unlock()
-	if eligible || !strings.Contains(reason, "weekly") {
-		t.Fatalf("eligible = %v reason=%q, want weekly capacity rejection", eligible, reason)
+	if eligible || !strings.Contains(reason, "below 10.00% reserve") {
+		t.Fatalf("eligible = %v reason=%q, want weekly reserve rejection", eligible, reason)
 	}
 }
 
-func TestCodexQuotaLongResetDetectedAsMonthly(t *testing.T) {
+func TestFiveHourBelowReserveIsIneligible(t *testing.T) {
+	g := testGuard(t)
+	raw := json.RawMessage(`{
+		"codex_quota": {
+			"last_refresh_at": "2026-06-22T09:55:00Z",
+			"five_hour": {"limit": 100, "remaining": 8, "reset_at": "2026-06-22T14:55:00Z"},
+			"weekly": {"limit": 100, "remaining": 90, "reset_at": "2026-06-29T09:55:00Z"}
+		}
+	}`)
+	result := g.applyAuthJSONQuota(pluginapi.HostAuthFileEntry{ID: "a", AuthIndex: "idx-a", Provider: "codex"}, raw, "auth_json")
+	if result.Error != "" {
+		t.Fatal(result.Error)
+	}
+	g.mu.Lock()
+	account := g.ensureAccountByKeyLocked("a")
+	account.Status = "active"
+	remaining, windows := g.remainingPercentLocked(account, g.now())
+	eligible, reason := g.accountEligibleLocked(account, remaining, windows, g.now())
+	g.mu.Unlock()
+	if remaining != 8 || windows[window7d] != 90 {
+		t.Fatalf("remaining = %.2f windows=%#v, want 5h=8 and weekly=90", remaining, windows)
+	}
+	if eligible || !strings.Contains(reason, "5h below 10.00% reserve") {
+		t.Fatalf("eligible = %v reason=%q, want 5h reserve rejection", eligible, reason)
+	}
+}
+
+func TestCodexQuotaDoesNotPromoteLongFiveHourResetToMonthly(t *testing.T) {
 	g := testGuard(t)
 	raw := json.RawMessage(`{
 		"codex_quota": {
@@ -991,17 +1738,17 @@ func TestCodexQuotaLongResetDetectedAsMonthly(t *testing.T) {
 	active := activeWindows(account)
 	g.mu.Unlock()
 	if remaining != 93 {
-		t.Fatalf("remaining = %.2f, want 93", remaining)
+		t.Fatalf("remaining = %.2f, want primary 5h 93", remaining)
 	}
-	if len(active) != 1 || active[0] != windowMonthly {
-		t.Fatalf("active windows = %#v, want monthly only", active)
+	if len(active) != 2 || active[0] != window5h || active[1] != window7d {
+		t.Fatalf("active windows = %#v, want 5h and weekly", active)
 	}
-	if windows[windowMonthly] != 93 {
-		t.Fatalf("monthly remaining = %.2f, want 93", windows[windowMonthly])
+	if windows[window5h] != 93 || windows[window7d] != 100 {
+		t.Fatalf("windows = %#v, want 5h=93 and weekly=100", windows)
 	}
 }
 
-func TestUsageAfterQuotaSnapshotIsDiagnosticOnly(t *testing.T) {
+func TestUsageAfterQuotaSnapshotReducesRemaining(t *testing.T) {
 	g := testGuard(t)
 	g.cfg.InflightReserveScore = 30000
 	raw := json.RawMessage(`{"codex_quota":{"last_refresh_at":"2026-06-22T09:55:00Z","five_hour":{"limit":100,"remaining":50},"weekly":{"limit":100,"remaining":80}}}`)
@@ -1015,20 +1762,20 @@ func TestUsageAfterQuotaSnapshotIsDiagnosticOnly(t *testing.T) {
 	remaining, windows := g.remainingPercentLocked(account, g.now())
 	g.mu.Unlock()
 	if remaining != 50 {
-		t.Fatalf("remaining = %.2f, want authoritative snapshot remaining 50", remaining)
+		t.Fatalf("remaining = %.2f, want fresh official 5h snapshot 50", remaining)
 	}
-	if windows[window5h] != 50 {
-		t.Fatalf("5h remaining = %.2f, want 50", windows[window5h])
+	if windows[window5h] != 50 || windows[window7d] != 80 {
+		t.Fatalf("windows = %#v, want fresh 5h=50 and weekly=80", windows)
 	}
 	g.mu.Lock()
 	account.Inflight = append(account.Inflight, inflightReserve{At: g.now()})
 	remaining, windows = g.remainingPercentLocked(account, g.now())
 	g.mu.Unlock()
 	if remaining != 47 {
-		t.Fatalf("remaining = %.2f, want snapshot minus inflight reserve 47", remaining)
+		t.Fatalf("remaining = %.2f, want 5h snapshot minus inflight reserve 47", remaining)
 	}
-	if windows[window5h] != 47 {
-		t.Fatalf("5h remaining = %.2f, want 47", windows[window5h])
+	if windows[window5h] != 47 || windows[window7d] != 77 {
+		t.Fatalf("windows = %#v, want 5h=47 and weekly=77", windows)
 	}
 }
 
@@ -1075,6 +1822,7 @@ func TestSnapshotMarksIneligibleCurrentAsStalePrimary(t *testing.T) {
 
 func TestBackgroundRefreshTargetsCurrentPrimaryOnly(t *testing.T) {
 	g := testGuard(t)
+	g.cfg.WeeklyBudgetEnabled = false
 	if req, ok := g.backgroundRefreshRequest(); ok {
 		t.Fatalf("background refresh request = %#v, want no request before primary selection", req)
 	}
@@ -1094,6 +1842,57 @@ func TestBackgroundRefreshTargetsCurrentPrimaryOnly(t *testing.T) {
 	}
 }
 
+func TestBackgroundRefreshCollectsMissingDailyWeeklyBudgetSamples(t *testing.T) {
+	g := testGuard(t)
+	g.cfg.WeeklyBudgetEnabled = true
+	g.mu.Lock()
+	account := g.ensureAccountByKeyLocked("a")
+	account.AuthID = "a"
+	account.AuthIndex = "idx-a"
+	account.Provider = "codex"
+	g.mu.Unlock()
+	files := []pluginapi.HostAuthFileEntry{{ID: "a", AuthIndex: "idx-a", Provider: "codex"}}
+	requests := g.backgroundRefreshRequests(files, g.now())
+	if len(requests) != 1 || requests[0].AuthID != "a" || requests[0].Force {
+		t.Fatalf("requests = %#v, want one normal daily sample refresh", requests)
+	}
+	g.mu.Lock()
+	account.WeeklyBudget.Samples = []weeklyQuotaSample{{LocalDate: weeklyBudgetLocalDate(g.now(), 8), At: g.now(), RemainingPercent: 90}}
+	g.mu.Unlock()
+	if requests = g.backgroundRefreshRequests(files, g.now()); len(requests) != 0 {
+		t.Fatalf("requests = %#v, want no repeat refresh after daily sample", requests)
+	}
+}
+
+func TestRebalanceAttemptIsPersistedBeforeKeeperCollection(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	previous := callHostFunc
+	t.Cleanup(func() { callHostFunc = previous })
+	callHostFunc = func(method string, payload any) (json.RawMessage, error) {
+		if method == pluginabi.MethodHostAuthList {
+			return mustJSON(t, authListResponse{}), nil
+		}
+		if method != pluginabi.MethodHostHTTPDo {
+			t.Fatalf("method = %q", method)
+		}
+		g.mu.Lock()
+		attempt := g.state.Rebalance.LastAttemptAt
+		g.mu.Unlock()
+		if attempt.IsZero() {
+			t.Fatal("rebalance attempt was not recorded before Keeper collection")
+		}
+		return nil, fmt.Errorf("keeper unavailable")
+	}
+	if _, err := g.runRebalanceNow(false); err == nil {
+		t.Fatal("rebalance succeeded, want Keeper failure")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if got := g.state.Rebalance.LastAttemptAt; !got.Equal(g.now()) {
+		t.Fatalf("last attempt = %v, want %v", got, g.now())
+	}
+}
+
 func TestBackgroundRefreshIncludesExpiredQuotaResetAuth(t *testing.T) {
 	g := testGuard(t)
 	resetAt := g.now().Add(-time.Minute)
@@ -1104,11 +1903,11 @@ func TestBackgroundRefreshIncludesExpiredQuotaResetAuth(t *testing.T) {
 	account.Provider = "codex"
 	account.Status = "active"
 	account.LastQuotaRefreshAt = resetAt.Add(-time.Minute)
-	account.QuotaSnapshots[window5h] = quotaWindowSnapshot{
-		At:               resetAt.Add(-5 * time.Hour),
+	account.QuotaSnapshots[window7d] = quotaWindowSnapshot{
+		At:               resetAt.Add(-7 * 24 * time.Hour),
 		Source:           "test",
 		RemainingPercent: 2,
-		LimitScore:       g.cfg.Default5hLimitScore,
+		LimitScore:       g.cfg.Default7dLimitScore,
 		ResetAt:          &resetAt,
 	}
 	g.mu.Unlock()
@@ -1136,11 +1935,11 @@ func TestBackgroundRefreshDoesNotRepeatExpiredQuotaResetAfterAttempt(t *testing.
 	account.Provider = "codex"
 	account.Status = "active"
 	account.LastQuotaRefreshAt = g.now()
-	account.QuotaSnapshots[window5h] = quotaWindowSnapshot{
-		At:               resetAt.Add(-5 * time.Hour),
+	account.QuotaSnapshots[window7d] = quotaWindowSnapshot{
+		At:               resetAt.Add(-7 * 24 * time.Hour),
 		Source:           "test",
 		RemainingPercent: 2,
-		LimitScore:       g.cfg.Default5hLimitScore,
+		LimitScore:       g.cfg.Default7dLimitScore,
 		ResetAt:          &resetAt,
 	}
 	g.mu.Unlock()
@@ -1167,11 +1966,11 @@ func TestBackgroundRefreshKeepsPrimaryAndForcesExpiredReset(t *testing.T) {
 	expired.Provider = "codex"
 	expired.Status = "active"
 	expired.LastQuotaRefreshAt = resetAt.Add(-time.Minute)
-	expired.QuotaSnapshots[window5h] = quotaWindowSnapshot{
-		At:               resetAt.Add(-5 * time.Hour),
+	expired.QuotaSnapshots[window7d] = quotaWindowSnapshot{
+		At:               resetAt.Add(-7 * 24 * time.Hour),
 		Source:           "test",
 		RemainingPercent: 1,
-		LimitScore:       g.cfg.Default5hLimitScore,
+		LimitScore:       g.cfg.Default7dLimitScore,
 		ResetAt:          &resetAt,
 	}
 	g.mu.Unlock()
@@ -1378,7 +2177,7 @@ func TestRefreshUsesHostHTTPAndAuthJSON(t *testing.T) {
 	remaining, _ := g.remainingPercentLocked(account, g.now())
 	g.mu.Unlock()
 	if remaining != 75 {
-		t.Fatalf("remaining = %.2f, want 75", remaining)
+		t.Fatalf("remaining = %.2f, want primary 5h 75", remaining)
 	}
 }
 
@@ -1414,7 +2213,7 @@ func TestResourceRefreshUsesKeeperEndpoint(t *testing.T) {
 			resp, _ := json.Marshal(pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{
 				"authIndex":"idx-a",
 				"status":"completed",
-				"quota":{"quota":[{"key":"rate_limit.primary_window","usedPercent":25,"window":{"seconds":2628000},"resetAt":"2026-07-22T21:16:52+08:00"}]},
+				"quota":{"quota":[{"key":"rate_limit.secondary_window","label":"Weekly","usedPercent":25,"window":{"seconds":604800},"resetAt":"2026-06-29T21:16:52+08:00"}]},
 				"refreshed_at":"2026-06-22T17:55:00+08:00"
 			}`)})
 			return resp, nil
@@ -1443,12 +2242,12 @@ func TestResourceRefreshUsesKeeperEndpoint(t *testing.T) {
 	account := g.ensureAccountByKeyLocked("a")
 	remaining, windows := g.remainingPercentLocked(account, g.now())
 	g.mu.Unlock()
-	if remaining != 75 || windows[windowMonthly] != 75 {
-		t.Fatalf("remaining = %.2f windows=%#v, want monthly 75 from keeper", remaining, windows)
+	if remaining != 75 || windows[window7d] != 75 {
+		t.Fatalf("remaining = %.2f windows=%#v, want weekly 75 from keeper", remaining, windows)
 	}
 }
 
-func TestKeeperQuotaRefreshResponseFeedsMonthly(t *testing.T) {
+func TestKeeperQuotaRefreshResponseFeedsWeekly(t *testing.T) {
 	g := testGuard(t)
 	raw := []byte(`{
 		"authIndex": "idx-a",
@@ -1456,16 +2255,16 @@ func TestKeeperQuotaRefreshResponseFeedsMonthly(t *testing.T) {
 		"quota": {
 			"id": "idx-a",
 			"quota": [{
-				"key": "rate_limit.primary_window",
-				"label": "Primary",
+				"key": "rate_limit.secondary_window",
+				"label": "Weekly",
 				"scope": "window",
 				"planType": "team",
 				"usedPercent": 10,
 				"allowed": true,
 				"limitReached": false,
-				"window": {"seconds": 2628000},
-				"resetAt": "2026-07-22T21:16:52+08:00",
-				"resetAfterSeconds": 2624419
+				"window": {"seconds": 604800},
+				"resetAt": "2026-06-29T21:16:52+08:00",
+				"resetAfterSeconds": 600000
 			}]
 		},
 		"refreshed_at": "2026-06-22T17:55:00+08:00"
@@ -1482,11 +2281,11 @@ func TestKeeperQuotaRefreshResponseFeedsMonthly(t *testing.T) {
 	if remaining != 90 {
 		t.Fatalf("remaining = %.2f, want 90", remaining)
 	}
-	if len(active) != 1 || active[0] != windowMonthly {
-		t.Fatalf("active windows = %#v, want monthly only", active)
+	if len(active) != 1 || active[0] != window7d {
+		t.Fatalf("active windows = %#v, want weekly only", active)
 	}
-	if windows[windowMonthly] != 90 {
-		t.Fatalf("monthly remaining = %.2f, want 90", windows[windowMonthly])
+	if windows[window7d] != 90 {
+		t.Fatalf("weekly remaining = %.2f, want 90", windows[window7d])
 	}
 }
 
@@ -1498,15 +2297,15 @@ func TestKeeperProPlanUsesProLimitMultiplierForUsageDelta(t *testing.T) {
 		"quota": {
 			"id": "idx-a",
 			"quota": [{
-				"key": "rate_limit.primary_window",
-				"label": "5h",
+				"key": "rate_limit.secondary_window",
+				"label": "Weekly",
 				"scope": "window",
 				"planType": "pro",
 				"usedPercent": 0,
 				"allowed": true,
 				"limitReached": false,
-				"window": {"seconds": 18000},
-				"resetAt": "2026-06-22T18:55:56+08:00"
+				"window": {"seconds": 604800},
+				"resetAt": "2026-06-29T18:55:56+08:00"
 			}]
 		},
 		"refreshed_at": "2026-06-22T10:00:00Z"
@@ -1519,7 +2318,7 @@ func TestKeeperProPlanUsesProLimitMultiplierForUsageDelta(t *testing.T) {
 	account := g.ensureAccountByKeyLocked("a")
 	account.Events = append(account.Events, usageEvent{At: g.now().Add(time.Minute), Score: 1000000})
 	remaining, windows := g.remainingPercentLocked(account, g.now().Add(2*time.Minute))
-	snap := account.QuotaSnapshots[window5h]
+	snap := account.QuotaSnapshots[window7d]
 	g.mu.Unlock()
 	if snap.PlanType != "pro" {
 		t.Fatalf("plan type = %q, want pro", snap.PlanType)
@@ -1527,15 +2326,15 @@ func TestKeeperProPlanUsesProLimitMultiplierForUsageDelta(t *testing.T) {
 	if snap.LimitScore != 20000000 {
 		t.Fatalf("limit score = %.0f, want 20000000", snap.LimitScore)
 	}
-	if remaining != 100 || windows[window5h] != 100 {
-		t.Fatalf("remaining = %.2f windows=%#v, want authoritative snapshot remaining 100", remaining, windows)
+	if remaining != 100 || windows[window7d] != 100 {
+		t.Fatalf("remaining = %.2f windows=%#v, want fresh official snapshot 100", remaining, windows)
 	}
 	g.mu.Lock()
 	account.Inflight = append(account.Inflight, inflightReserve{At: g.now()})
 	remaining, windows = g.remainingPercentLocked(account, g.now().Add(2*time.Minute))
 	g.mu.Unlock()
-	if remaining != 99.85 || windows[window5h] != 99.85 {
-		t.Fatalf("remaining = %.2f windows=%#v, want Pro 20x inflight deduction 99.85", remaining, windows)
+	if remaining != 99.85 || windows[window7d] != 99.85 {
+		t.Fatalf("remaining = %.2f windows=%#v, want Pro inflight deduction 99.85", remaining, windows)
 	}
 }
 
@@ -1596,14 +2395,124 @@ func TestKeeperPrimaryWindowsOverrideAdditionalModelWindows(t *testing.T) {
 	g.mu.Lock()
 	account := g.ensureAccountByKeyLocked("a")
 	remaining, windows := g.remainingPercentLocked(account, g.now())
-	fiveHour := account.QuotaSnapshots[window5h]
 	weekly := account.QuotaSnapshots[window7d]
 	g.mu.Unlock()
 	if remaining != 85 || windows[window5h] != 85 || windows[window7d] != 89 {
-		t.Fatalf("remaining = %.2f windows=%#v, want primary 5h=85 weekly=89", remaining, windows)
+		t.Fatalf("remaining = %.2f windows=%#v, want primary 5h=85 and weekly=89", remaining, windows)
 	}
-	if fiveHour.Label != "5h" || weekly.Label != "Weekly" {
-		t.Fatalf("labels = %q/%q, want primary labels", fiveHour.Label, weekly.Label)
+	if weekly.Label != "Weekly" {
+		t.Fatalf("weekly label = %q, want Weekly", weekly.Label)
+	}
+}
+
+func TestKeeperProSparkWindowsDoNotBecomeGeneralQuota(t *testing.T) {
+	g := testGuard(t)
+	raw := []byte(`{
+		"quota": {"quota": [
+			{
+				"key": "rate_limit.primary_window",
+				"label": "Weekly",
+				"scope": "window",
+				"planType": "pro",
+				"usedPercent": 8,
+				"window": {"seconds": 604800},
+				"resetAt": "2026-09-01T22:31:39+08:00"
+			},
+			{
+				"key": "additional_rate_limits.GPT-5.3-Codex-Spark.primary_window",
+				"label": "GPT-5.3-Codex-Spark 5h",
+				"scope": "additional",
+				"metric": "codex_bengalfox",
+				"planType": "pro",
+				"usedPercent": 99,
+				"window": {"seconds": 18000},
+				"resetAt": "2026-08-26T13:37:31+08:00"
+			}
+		]},
+		"refreshed_at": "2026-08-26T08:37:31+08:00"
+	}`)
+	result, ok := g.applyKeeperQuotaRefresh(pluginapi.HostAuthFileEntry{ID: "pro", AuthIndex: "idx-pro", Provider: "codex"}, raw, "keeper-refresh")
+	if !ok {
+		t.Fatalf("keeper refresh was not parsed: %#v", result)
+	}
+	g.mu.Lock()
+	account := g.ensureAccountByKeyLocked("pro")
+	remaining, windows := g.remainingPercentLocked(account, g.now())
+	active := activeWindows(account)
+	g.mu.Unlock()
+	if remaining != 92 || windows[window7d] != 92 {
+		t.Fatalf("remaining = %.2f windows=%#v, want general weekly 92", remaining, windows)
+	}
+	if _, exists := windows[window5h]; exists || len(active) != 1 || active[0] != window7d {
+		t.Fatalf("active=%#v windows=%#v, want Spark 5h excluded", active, windows)
+	}
+}
+
+func TestStatusPageWrapsLongWeeklyBudgetReason(t *testing.T) {
+	page := string(renderStatusPage(statusResponse{
+		Affinity: affinitySnapshot{Groups: []affinityGroupSnapshot{{
+			ID:              "group-a",
+			Eligible:        true,
+			BudgetReason:    "T+1 weekly budget: burn 30.00% vs 8.79% expected, remaining 26.00% vs 64.44% trajectory; reset drift +293m ignored",
+			WeeklyRemaining: 26,
+		}}},
+	}))
+	if !strings.Contains(page, `class="load-cell"`) {
+		t.Fatalf("status page does not use wrapping load cell: %s", page)
+	}
+	if !strings.Contains(page, "T+1 weekly budget: burn 30.00%") || !strings.Contains(page, "title=\"") {
+		t.Fatalf("status page does not retain budget reason as compact tooltip: %s", page)
+	}
+	if strings.Contains(page, "<details open><summary>Rebalance Moves") || strings.Contains(page, "<details open><summary>Analysis Log") {
+		t.Fatalf("rebalance log details should be collapsed by default: %s", page)
+	}
+}
+
+func TestProxyDisplayURLKeepsSchemeAndPortOnly(t *testing.T) {
+	for raw, want := range map[string]string{
+		"socks5://172.17.0.1:5556":                "socks5://*:5556",
+		"socks5://user:secret@proxy.example:1080": "socks5://*:1080",
+		"http://proxy.example":                    "http://*",
+	} {
+		if got := proxyDisplayURL(raw); got != want {
+			t.Fatalf("proxyDisplayURL(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestProxyMappingPrefersEmailAndRejectsConflictingAccountID(t *testing.T) {
+	mappings := proxyMapFile{Accounts: map[string]proxyMapEntry{
+		"account-1": {Email: "user@example.com", ProxyURL: "socks5://127.0.0.1:5556"},
+	}}
+	byID, key := proxyMappingForFile(pluginapi.HostAuthFileEntry{Account: "account-1", Email: "other@example.com"}, mappings)
+	if key != "" || byID.ProxyURL != "" {
+		t.Fatalf("conflicting account mapping = %#v/%q, want no match", byID, key)
+	}
+	byEmail, key := proxyMappingForFile(pluginapi.HostAuthFileEntry{Email: "USER@example.com"}, mappings)
+	if key != "account-1" || byEmail.ProxyURL == "" {
+		t.Fatalf("email mapping = %#v/%q, want case-insensitive fallback", byEmail, key)
+	}
+}
+
+func TestLearnProxyMappingUsesEmailWhenAccountIDConflicts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proxy-map.json")
+	mappings := proxyMapFile{Accounts: map[string]proxyMapEntry{
+		"account-1": {Email: "old@example.com", ProxyURL: "socks5://127.0.0.1:5556"},
+	}}
+	file := pluginapi.HostAuthFileEntry{Account: "account-1", Email: "new@example.com"}
+	if errLearn := learnProxyMapping(file, "socks5://127.0.0.1:5553", mappings, path); errLearn != nil {
+		t.Fatal(errLearn)
+	}
+	loaded, errLoad := loadProxyMap(path)
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	if loaded.Accounts["new@example.com"].ProxyURL != "socks5://127.0.0.1:5553" {
+		t.Fatalf("learned mapping = %#v", loaded.Accounts["new@example.com"])
+	}
+	if loaded.Accounts["account-1"].Email != "old@example.com" {
+		t.Fatalf("existing mapping was overwritten: %#v", loaded.Accounts["account-1"])
 	}
 }
 
@@ -1612,8 +2521,8 @@ func TestStaleRealQuotaDoesNotFallbackToEstimatedFull(t *testing.T) {
 	g.cfg.QuotaSnapshotMaxAgeSecs = 60
 	g.mu.Lock()
 	account := g.ensureAccountByKeyLocked("a")
-	account.ActiveWindows = map[string]bool{window5h: true}
-	account.QuotaSnapshots[window5h] = quotaWindowSnapshot{
+	account.ActiveWindows = map[string]bool{window7d: true}
+	account.QuotaSnapshots[window7d] = quotaWindowSnapshot{
 		At:               g.now().Add(-2 * time.Minute),
 		Limit:            100,
 		RemainingPercent: 8,
@@ -1623,7 +2532,7 @@ func TestStaleRealQuotaDoesNotFallbackToEstimatedFull(t *testing.T) {
 	mode := quotaMode(account, g.now(), g.cfg)
 	g.mu.Unlock()
 	if remaining != 8 {
-		t.Fatalf("remaining = %.2f, want stale real quota remaining 8", remaining)
+		t.Fatalf("remaining = %.2f, want conservative stale real quota remaining 8", remaining)
 	}
 	if mode != "real+usage stale" {
 		t.Fatalf("quota mode = %q, want stale marker", mode)
@@ -1740,6 +2649,44 @@ func TestFetchKeeperUsageSnapshotParsesAuthFiles(t *testing.T) {
 	}
 }
 
+func TestFetchKeeperAPIKeyUsageParsesFilteredModels(t *testing.T) {
+	g := testGuard(t)
+	previous := callHostFunc
+	t.Cleanup(func() { callHostFunc = previous })
+	callHostFunc = func(method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			t.Fatalf("method = %q", method)
+		}
+		resp, _ := json.Marshal(pluginapi.HTTPResponse{StatusCode: 200, Body: mustJSON(t, map[string]any{
+			"window_end":    g.now(),
+			"current_usage": map[string]any{"models": []map[string]any{{"tokens": 4567, "requests": 9}}},
+		})})
+		return resp, nil
+	}
+	item, ok := fetchKeeperAPIKeyUsageItem("http://keeper/usage?api_key_id=42", "42", g.now())
+	if !ok || item.Tokens != 4567 || item.Requests != 9 {
+		t.Fatalf("api key usage = %#v, ok=%v", item, ok)
+	}
+}
+
+func TestMinimumTrafficFloorKeepsEveryEligibleGroupTargetAboveFloor(t *testing.T) {
+	g := testGuard(t)
+	loads := map[string]groupLoadState{
+		"a": {GroupID: "a", Capacity: 100, Eligible: true},
+		"b": {GroupID: "b", Capacity: 10, Eligible: true},
+		"c": {GroupID: "c", Capacity: 10, Eligible: true},
+	}
+	for id, load := range loads {
+		loads[id] = load
+	}
+	applyTargetShares(loads, 120, g.cfg)
+	for id, load := range loads {
+		if load.TargetShare < 5 {
+			t.Fatalf("target share for %s = %.2f, want at least 5%%", id, load.TargetShare)
+		}
+	}
+}
+
 func TestFetchKeeperUsageSnapshotFailsClosed(t *testing.T) {
 	g := testGuard(t)
 	previous := callHostFunc
@@ -1846,6 +2793,49 @@ func TestRebalanceMovesOneIdleRecentlyUsedBinding(t *testing.T) {
 	}
 }
 
+func TestRebalancePreservesLastBindingInEligibleGroup(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	addRebalanceClient(g, "client-only", "group-a", g.now().Add(-15*time.Minute), 30)
+	entry := g.analyzeRebalanceLocked(rebalanceSnapshot(g, 90, 10), false)
+	if entry.Result == "moved" {
+		t.Fatalf("entry = %#v, want last binding protected", entry)
+	}
+	if got := g.state.ClientBindings["client-only"].GroupID; got != "group-a" {
+		t.Fatalf("group = %q, want group-a", got)
+	}
+}
+
+func TestRebalanceRepairsEmptyEligibleGroupBeforePressureMove(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	g.cfg.ClientAffinityRebalanceOverload = 10
+	addRebalanceClient(g, "client-one", "group-a", g.now().Add(-15*time.Minute), 30)
+	addRebalanceClient(g, "client-two", "group-a", g.now().Add(-20*time.Minute), 20)
+	entry := g.analyzeRebalanceLocked(rebalanceSnapshot(g, 90, 0), false)
+	if entry.Result != "moved" {
+		t.Fatalf("entry = %#v, want empty group repair", entry)
+	}
+	if got := g.state.ClientBindings[entry.ClientID].GroupID; got != "group-b" {
+		t.Fatalf("moved group = %q, want group-b", got)
+	}
+}
+
+func TestRebalanceDoesNotRepairFloorIntoMoreLoadedGroup(t *testing.T) {
+	g := setupRebalanceGuard(t)
+	g.cfg.ClientAffinityRebalanceOverload = 10
+	addRebalanceClient(g, "client-one", "group-a", g.now().Add(-15*time.Minute), 30)
+	addRebalanceClient(g, "client-two", "group-a", g.now().Add(-20*time.Minute), 20)
+	entry := g.analyzeRebalanceLocked(rebalanceSnapshot(g, 10, 90), false)
+	if entry.Result == "moved" {
+		t.Fatalf("entry = %#v, want a more loaded floor target rejected", entry)
+	}
+	if got := g.state.ClientBindings["client-one"].GroupID; got != "group-a" {
+		t.Fatalf("client-one group = %q, want group-a", got)
+	}
+	if got := g.state.ClientBindings["client-two"].GroupID; got != "group-a" {
+		t.Fatalf("client-two group = %q, want group-a", got)
+	}
+}
+
 func TestRebalanceEmptyUsageWindowIsSkippedWithoutError(t *testing.T) {
 	g := setupRebalanceGuard(t)
 	snapshot := keeperUsageSnapshot{WindowStart: g.now().Add(-time.Hour), WindowEnd: g.now(), FetchedAt: g.now(), AuthFiles: map[string]keeperUsageItem{}}
@@ -1943,6 +2933,7 @@ func TestNormalizeConfigUsesKeeperSupportedFastWindow(t *testing.T) {
 
 func TestRebalanceRequiresConsecutiveOverloadSamples(t *testing.T) {
 	g := setupRebalanceGuard(t)
+	g.cfg.ClientAffinityMinLoadEnabled = false
 	g.cfg.ClientAffinityRebalanceStreak = 3
 	addRebalanceClient(g, "client-idle", "group-a", g.now().Add(-15*time.Minute), 30)
 	addRebalanceClient(g, "client-active", "group-a", g.now().Add(-10*time.Second), 60)
@@ -2023,7 +3014,7 @@ func TestRebalanceFailsClosedForUnattributedSharedBackup(t *testing.T) {
 	snapshot := rebalanceSnapshot(g, 90, 10)
 	snapshot.AuthFiles["idx-shared"] = keeperUsageItem{AuthIndex: "idx-shared", Tokens: 50, Requests: 5}
 	entry := g.analyzeRebalanceLocked(snapshot, false)
-	if entry.Result != "error" || !strings.Contains(entry.Reason, "cannot be attributed") {
+	if entry.Result == "error" || !strings.Contains(entry.Reason, "no safe client move") {
 		t.Fatalf("entry = %#v", entry)
 	}
 }

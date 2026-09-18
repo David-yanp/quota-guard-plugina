@@ -10,9 +10,7 @@ plugins:
       sticky_current_auth_seconds: 120
       fail_when_all_low: true
       delegate_when_unconfigured: "fill-first"
-      default_5h_limit_score: 1000000
       default_7d_limit_score: 10000000
-      default_monthly_limit_score: 40000000
       pro_limit_multiplier: 20
       inflight_reserve_score: 30000
       max_inflight_age_seconds: 1800
@@ -33,13 +31,25 @@ plugins:
       quota_snapshot_max_age_seconds: 900
       resource_actions_require_management_key: false
       request_error_status_override_enabled: true
+      legacy_primary_auth: ""
       client_affinity_enabled: false
       client_affinity_header: "X-CPA-Client-ID"
       client_affinity_group_min_size: 2
       client_affinity_assignment_mode: "auto-with-overrides"
       client_affinity_store_plain_id: true
       client_affinity_auto_weight_by_quota: true
-      client_affinity_repeatable_auths: []
+      client_affinity_repeatable_auths:
+        - "replace-with-pro-auth-index"
+      client_affinity_api_key_map: {}
+      client_affinity_min_load_enabled: true
+      client_affinity_min_binding_per_group: 1
+      client_affinity_min_traffic_percent: 5
+      client_affinity_dormant_seconds: 86400
+      client_affinity_rebalance_api_key_enabled: true
+      client_affinity_rebalance_api_key_usage_endpoint: "http://cpa-usage-keeper:8080/cpa/api/v1/usage/overview/realtime?window=60m&api_key_id={api_key_id}"
+      client_affinity_rebalance_api_key_refresh_seconds: 300
+      client_affinity_rebalance_unknown_client_policy: "local-fallback"
+      client_affinity_rebalance_unattributed_policy: "observe-only"
       client_affinity_groups: {}
       client_affinity_rebalance_enabled: true
       client_affinity_rebalance_mode: "observe"
@@ -49,7 +59,7 @@ plugins:
       client_affinity_rebalance_fast_window_minutes: 15
       client_affinity_rebalance_fast_weight: 0.7
       client_affinity_rebalance_idle_seconds: 30
-      client_affinity_rebalance_cooldown_seconds: 2700
+      client_affinity_rebalance_cooldown_seconds: 21600
       client_affinity_manual_move_cooldown_seconds: 86400
       client_affinity_rebalance_warmup_seconds: 3600
       client_affinity_rebalance_max_moves_per_cycle: 1
@@ -59,3 +69,11 @@ plugins:
       client_affinity_rebalance_target_threshold: 0.85
       client_affinity_rebalance_overload_consecutive: 3
       client_affinity_rebalance_history_limit: 200
+      weekly_budget_enabled: true
+      weekly_budget_timezone_offset_hours: 8
+      weekly_budget_max_adjustment_percent: 20
+      proxy_restore_enabled: false
+      proxy_map_file: "plugins/quota-guard-proxy-map.json"
+      proxy_restore_interval_seconds: 15
+      proxy_restore_settle_seconds: 3
+      proxy_restore_block_missing: true
